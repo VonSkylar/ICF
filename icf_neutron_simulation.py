@@ -180,26 +180,7 @@ def ray_mesh_intersection(
     geometry: MeshGeometry,
     epsilon: float = 1e-9,
 ) -> Optional[Tuple[float, np.ndarray, np.ndarray]]:
-    """Return the nearest intersection between a ray and the mesh, if any.
-
-    Parameters
-    ----------
-    origin : np.ndarray, shape (3,)
-        Origin of the ray.
-    direction : np.ndarray, shape (3,)
-        Unit vector giving the ray direction.
-    geometry : MeshGeometry
-        Preprocessed mesh information from :func:`prepare_mesh_geometry`.
-    epsilon : float, optional
-        Numerical tolerance for the intersection test.
-
-    Returns
-    -------
-    tuple or None
-        ``(distance, point, normal)`` for the closest intersection along the
-        ray (with ``distance > 0``), or ``None`` if the ray does not hit the
-        mesh.
-    """
+    """Return the nearest intersection between a ray and the mesh, if any."""
     v0 = geometry.vertices0
     edge1 = geometry.edge1
     edge2 = geometry.edge2
@@ -247,55 +228,13 @@ def ray_mesh_intersection(
     return distance, point, normal
 
 
-def mesh_radius_bounds(
-    vertices: np.ndarray,
-    inner_quantile: float = 0.05,
-    outer_quantile: float = 0.95,
-) -> Tuple[float, float, np.ndarray]:
-    """Estimate inner/outer radii for a spherical shell mesh and its centre.
-
-    The routine performs a least-squares fit of a sphere to the mesh vertices
-    to approximate the geometric centre.  Radii are then computed relative to
-    this centre and summarised using quantiles to suppress the impact of small
-    features (e.g. alignment tabs) that may protrude from the nominal shell
-    surface.
-
-    Parameters
-    ----------
-    vertices : np.ndarray, shape (n_facets, 3, 3)
-        Triangle vertices produced by :func:`load_stl_mesh`.
-    inner_quantile : float, optional
-        Quantile in [0, 0.5) used to summarise the inner surface radius.  The
-        default of 0.05 (5 %) is robust against small surface imperfections.
-    outer_quantile : float, optional
-        Quantile in (0.5, 1] used to summarise the outer surface radius.  The
-        default of 0.95 (95 %) likewise suppresses outer protrusions.
-
-    Returns
-    -------
-    tuple
-        ``(inner_radius, outer_radius, centre)`` where the radii are in the same
-        units as the mesh coordinates and ``centre`` is the fitted sphere centre.
-    """
-    pts = vertices.reshape(-1, 3)
+def mesh_distance_statistics(mesh: np.ndarray) -> Tuple[float, float]:
+    """Return mean and maximum distance of mesh vertices from the origin."""
+    pts = np.asarray(mesh, dtype=float).reshape(-1, 3)
     if pts.size == 0:
-        raise ValueError("Mesh does not contain any vertices - cannot determine radii")
-    # Fit the sphere centre using a linear least squares approach:
-    # (x^2 + y^2 + z^2) = 2*cx*x + 2*cy*y + 2*cz*z + c0
-    A = np.hstack((2.0 * pts, np.ones((pts.shape[0], 1))))
-    b = np.sum(pts * pts, axis=1)
-    coeffs, *_ = np.linalg.lstsq(A, b, rcond=None)
-    centre = coeffs[:3]
-    radii = np.linalg.norm(pts - centre, axis=1)
-    inner = float(np.quantile(radii, inner_quantile))
-    outer = float(np.quantile(radii, outer_quantile))
-    return inner, outer, centre
-
-
-def mesh_shell_thickness(vertices: np.ndarray) -> float:
-    """Estimate the thickness of a spherical shell represented by an STL mesh."""
-    inner, outer, _ = mesh_radius_bounds(vertices)
-    return outer - inner
+        raise ValueError("Mesh does not contain any vertices - cannot compute distances")
+    radii = np.linalg.norm(pts, axis=1)
+    return float(np.mean(radii)), float(np.max(radii))
 
 
 ################################################################################
@@ -434,7 +373,7 @@ def simulate_in_aluminium(
     target_mass_ratio: float,
     energy_cutoff_mev: float = 0.1,
     mesh_geometry: Optional[MeshGeometry] = None,
-) -> Tuple[float, float, np.ndarray]:
+) -> Tuple[float, float, np.ndarray, np.ndarray]:
     """Simulate neutron transport and scattering in an aluminium shell.
 
     When ``mesh_geometry`` is provided the neutron first propagates in vacuum
@@ -467,10 +406,12 @@ def simulate_in_aluminium(
 
     Returns
     -------
-    tuple of (time, energy, direction)
-        * **time** – the total time from the target centre to exiting the shell (s).
+    tuple of (time, energy, direction, position)
+        * **time** – the total time spent from the target centre to the aluminium
+          exit point (s).
         * **energy** – the neutron energy after leaving the shell (MeV).
         * **direction** – the final direction unit vector when exiting the shell.
+        * **position** – 3‑D position (m) of the exit point relative to the origin.
     """
     direction = np.array(direction, dtype=float)
     norm = np.linalg.norm(direction)
@@ -483,39 +424,95 @@ def simulate_in_aluminium(
     cumulative_time = 0.0
 
     # If a mesh is supplied, determine whether the neutron encounters aluminium.
-    if mesh_geometry is not None:
-        origin = np.zeros(3, dtype=float)
-        hit = ray_mesh_intersection(origin, direction, mesh_geometry)
-        if hit is None:
-            # No aluminium along this trajectory; the neutron exits immediately.
-            return cumulative_time, energy, direction
-        distance_to_surface, _, normal = hit
-        cumulative_time += distance_to_surface / speed
-        cos_incident = abs(float(np.dot(direction, normal)))
-        effective_path = shell_thickness / max(cos_incident, 1e-6)
-    else:
-        # Fallback to simple spherical treatment.
+    origin = np.zeros(3, dtype=float)
+
+    if mesh_geometry is None:
+        # Simple slab approximation when no geometry is supplied.
         effective_path = shell_thickness
+        current_dir = direction.copy()
+        position = origin.copy()
+        position += current_dir * effective_path
+        remaining_path = effective_path
+        while energy > energy_cutoff_mev and remaining_path > 0.0:
+            free_path = -mean_free_path * math.log(max(1e-12, np.random.rand()))
+            step_length = min(free_path, remaining_path)
+            cumulative_time += step_length / speed
+            remaining_path -= step_length
+            if step_length < free_path:
+                energy = scatter_energy_elastic(energy, target_mass_ratio)
+                current_dir = sample_isotropic_direction()
+                speed = energy_to_speed(energy)
+            else:
+                break
+        return cumulative_time, energy, current_dir, position
 
-    remaining_path = effective_path
+    # Detailed treatment using STL geometry
+    hit = ray_mesh_intersection(origin, direction, mesh_geometry)
+    if hit is None:
+        # Trajectory leaves through an opening without touching aluminium.
+        return cumulative_time, energy, direction, origin.copy()
+
+    distance_to_outer, outer_point, normal = hit
+    normal_len = np.linalg.norm(normal)
+    if normal_len > 0.0:
+        normal = normal / normal_len
+    cos_incident = float(np.dot(direction, normal))
+    if cos_incident <= 0.0:
+        normal = -normal
+        cos_incident = -cos_incident
+    cos_incident = max(cos_incident, 1e-6)
+
+    path_length_along_direction = shell_thickness / cos_incident
+    distance_to_entry = max(distance_to_outer - path_length_along_direction, 0.0)
+    cumulative_time += distance_to_entry / speed
+    position = origin + direction * distance_to_entry
+    depth = 0.0  # distance travelled along +normal from inner surface
+
+    EPS = 1e-9
+    position += direction * EPS
+    depth += EPS * cos_incident
+
     current_dir = direction.copy()
+    exit_position = position.copy()
 
-    while energy > energy_cutoff_mev and remaining_path > 0.0:
+    while energy > energy_cutoff_mev:
         free_path = -mean_free_path * math.log(max(1e-12, np.random.rand()))
-        step_length = min(free_path, remaining_path)
-        cumulative_time += step_length / speed
-        remaining_path -= step_length
+        dot = float(np.dot(current_dir, normal))
+        travel = free_path
+        boundary = None
 
-        if step_length < free_path:
-            # Collision occurred before reaching the shell boundary.
-            energy = scatter_energy_elastic(energy, target_mass_ratio)
-            current_dir = sample_isotropic_direction()
-            speed = energy_to_speed(energy)
-        else:
-            # Traversed the remaining aluminium without another collision.
-            break
+        if dot > 1e-9:
+            dist_outer = (shell_thickness - depth) / dot
+            dist_outer = max(dist_outer, 0.0)
+            if dist_outer <= free_path:
+                travel = dist_outer
+                boundary = "outer"
+        elif dot < -1e-9:
+            dist_inner = -depth / dot
+            dist_inner = max(dist_inner, 0.0)
+            if dist_inner <= free_path:
+                travel = dist_inner
+                boundary = "inner"
 
-    return cumulative_time, energy, current_dir
+        if travel > 0.0:
+            position = position + current_dir * travel
+            cumulative_time += travel / speed
+            depth += travel * dot
+            depth = min(max(depth, 0.0), shell_thickness)
+
+        if boundary == "outer":
+            exit_position = position.copy()
+            return cumulative_time, energy, current_dir, exit_position
+        if boundary == "inner":
+            # Returned to the cavity; treat as leaving the shell inward.
+            return cumulative_time, energy, current_dir, position
+
+        # Collision within aluminium
+        energy = scatter_energy_elastic(energy, target_mass_ratio)
+        current_dir = sample_isotropic_direction()
+        speed = energy_to_speed(energy)
+
+    return cumulative_time, energy, current_dir, position
 
 
 ################################################################################
@@ -523,6 +520,7 @@ def simulate_in_aluminium(
 ################################################################################
 
 def propagate_to_scintillator(
+    position: np.ndarray,
     direction: np.ndarray,
     energy_mev: float,
     distance_to_detector: float = 16.0,
@@ -534,15 +532,17 @@ def propagate_to_scintillator(
 
     The scintillator is modelled as a square detector of side length
     ``detector_side`` located a distance ``distance_to_detector`` metres away
-    along the +z axis from the source.  Between the source and detector is a
-    square PVC collimating channel of the same cross-section.  A neutron must
-    travel entirely within the channel aperture to reach the scintillator;
-    should it strike the channel wall it is absorbed with probability
-    ``collimator_absorption`` (default 99 %).  Rare survivors are assumed to
-    continue along their original trajectory.
+    along the +z axis from the source centre.  Between the source and detector
+    is a square PVC collimating channel of the same cross-section.  A neutron
+    starting from ``position`` must travel entirely within the channel aperture
+    to reach the scintillator; should it strike the channel wall it is absorbed
+    with probability ``collimator_absorption`` (default 99 %).  Rare survivors
+    are assumed to continue along their original trajectory.
 
     Parameters
     ----------
+    position : np.ndarray, shape (3,)
+        Starting position in metres (typically the shell exit point).
     direction : np.ndarray, shape (3,)
         Unit vector giving the direction of motion leaving the aluminium shell.
     energy_mev : float
@@ -569,6 +569,7 @@ def propagate_to_scintillator(
         collimator, both return values are ``None``.
     """
     # Normalise direction to ensure it is a unit vector
+    pos = np.array(position, dtype=float)
     d = np.array(direction, dtype=float)
     norm = np.linalg.norm(d)
     if norm == 0.0:
@@ -579,45 +580,65 @@ def propagate_to_scintillator(
     if d[2] <= 0.0:
         return None, None
 
-    speed = energy_to_speed(energy_mev)
-
-    # Compute slopes of the trajectory in x and y as a function of z.
-    half_size = detector_side / 2.0
-    slope_x = d[0] / d[2] if abs(d[2]) > 0 else float("inf")
-    slope_y = d[1] / d[2] if abs(d[2]) > 0 else float("inf")
-
-    # Determine whether the trajectory stays within the channel for its full
-    # length.  Because the path is a straight line, the maximum lateral
-    # displacement occurs at the channel exit.
-    x_at_exit = slope_x * distance_to_detector
-    y_at_exit = slope_y * distance_to_detector
-
-    def _wall_intersection_z(slope: float) -> Optional[float]:
-        if abs(slope) < 1e-12:
-            return None
-        z_hit = half_size / abs(slope)
-        return z_hit if 0.0 < z_hit < distance_to_detector else None
-
-    wall_hits = [
-        z_hit for z_hit in (_wall_intersection_z(slope_x), _wall_intersection_z(slope_y)) if z_hit is not None
-    ]
-
-    if abs(x_at_exit) > half_size or abs(y_at_exit) > half_size:
-        # The neutron will intersect a channel wall before reaching the detector.
-        if not wall_hits:
-            return None, None
-        if np.random.rand() < collimator_absorption:
-            return None, None
-        # Survivor: continue to detector along the same trajectory.
-        # (The residual time is simply the full flight time; time to wall is
-        # already included in this value.)
-
     if energy_mev <= energy_cutoff_mev:
         return None, None
 
-    t_total = distance_to_detector / d[2]
-    flight_time = t_total / speed
-    hit = d * t_total
+    speed = energy_to_speed(energy_mev)
+    half_size = detector_side / 2.0
+
+    flight_time = 0.0
+
+    # Move to the start of the collimator (z = 0) if the neutron exits behind it.
+    if pos[2] < 0.0:
+        t_entry = (0.0 - pos[2]) / d[2]
+        if t_entry < 0.0:
+            return None, None
+        flight_time += t_entry / speed
+        pos = pos + d * t_entry
+
+    # Check if the entry point lies within the channel aperture.
+    if abs(pos[0]) > half_size or abs(pos[1]) > half_size:
+        if np.random.rand() < collimator_absorption:
+            return None, None
+        pos[0] = max(min(pos[0], half_size), -half_size)
+        pos[1] = max(min(pos[1], half_size), -half_size)
+
+    # Determine potential wall intersections along the remaining path.
+    def _wall_hit_z(component: float, slope: float) -> Optional[float]:
+        if abs(slope) < 1e-12:
+            return None
+        hits: List[float] = []
+        for sign in (-1.0, 1.0):
+            numerator = sign * half_size - component
+            z_hit = pos[2] + numerator / slope
+            if z_hit > pos[2] + 1e-9 and z_hit < distance_to_detector - 1e-9:
+                hits.append(z_hit)
+        if not hits:
+            return None
+        return min(hits)
+
+    slope_x = d[0] / d[2]
+    slope_y = d[1] / d[2]
+    wall_candidates = [z for z in (_wall_hit_z(pos[0], slope_x), _wall_hit_z(pos[1], slope_y)) if z is not None]
+    z_wall = min(wall_candidates) if wall_candidates else None
+
+    if z_wall is not None:
+        distance_to_wall = (z_wall - pos[2]) / d[2]
+        if distance_to_wall > 0.0:
+            flight_time += distance_to_wall / speed
+            pos = pos + d * distance_to_wall
+        if np.random.rand() < collimator_absorption:
+            return None, None
+
+    # Propagate to the detector plane (z = distance_to_detector).
+    t_total = (distance_to_detector - pos[2]) / d[2]
+    if t_total <= 0.0:
+        return None, None
+    hit = pos + d * t_total
+    if abs(hit[0]) > half_size or abs(hit[1]) > half_size:
+        return None, None
+
+    flight_time += t_total / speed
     return flight_time, hit
 
 
@@ -756,7 +777,7 @@ def simulate_neutron_history(
     d0 = sample_isotropic_direction()
 
     # 2. Transport through the aluminium shell
-    t_shell, E_after_shell, d_after_shell = simulate_in_aluminium(
+    t_shell, E_after_shell, d_after_shell, pos_after_shell = simulate_in_aluminium(
         d0,
         E0,
         shell_thickness,
@@ -771,6 +792,7 @@ def simulate_neutron_history(
 
     # 3. Flight to the scintillator with collimator losses
     flight_time, hit_point = propagate_to_scintillator(
+        pos_after_shell,
         d_after_shell,
         E_after_shell,
         distance_to_detector=detector_distance,
@@ -869,17 +891,15 @@ if __name__ == "__main__":
     unit_scale = 1.0e-3  # Convert millimetres to metres
     mesh_scaled = shell_mesh * unit_scale
     shell_geometry = prepare_mesh_geometry(mesh_scaled)
+    mean_radius, max_radius = mesh_distance_statistics(mesh_scaled)
 
-    radii = np.linalg.norm(mesh_scaled.reshape(-1, 3), axis=1)
-    inner_radius_est = float(np.quantile(radii, 0.05))
-    outer_radius_est = float(np.quantile(radii, 0.95))
     shell_thickness = 0.08  # metres (given design thickness)
 
-    print(
-        f"[info] STL radii (metres): inner≈{inner_radius_est:.4f}, "
-        f"outer≈{outer_radius_est:.4f}, estimated thickness≈{outer_radius_est - inner_radius_est:.4f}"
-    )
     print(f"[info] Using specified shell thickness of {shell_thickness:.3f} m")
+    print(
+        f"[info] STL vertex distances: mean={mean_radius:.4f} m, "
+        f"max={max_radius:.4f} m"
+    )
 
     # Simulation parameters (adjust as needed)
     n_neutrons = 1000
@@ -907,3 +927,5 @@ if __name__ == "__main__":
     print(f"Simulated {len(tof_list)} neutrons reaching the scintillator out of {n_neutrons}")
     if tof_list:
         print(f"Mean time of flight: {np.mean(tof_list):.3e} s")
+    for tof in tof_list:
+        print(f"{tof:.6e}")

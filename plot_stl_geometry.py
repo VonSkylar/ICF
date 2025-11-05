@@ -1,33 +1,18 @@
-"""Visualise the target STL geometry to verify orientation and scale.
-
-This utility reuses the STL loader from ``icf_neutron_simulation`` and renders
-the mesh with Matplotlib.  It recentres the geometry on the fitted sphere
-centre so that visual inspection is easier when the original CAD export is not
-aligned with the origin.
-
-Usage
------
-    python plot_stl_geometry.py --stl Target_ball_model.stl --scale 1e-4
-
-The default scale converts STL units that are stored in 0.1 mm to metres.  If
-your STL uses millimetres or metres, adjust ``--scale`` accordingly.
-"""
+"""Visualise the target STL geometry in millimetres relative to the origin."""
 
 from __future__ import annotations
 
 import argparse
 from pathlib import Path
-from typing import Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
-from icf_neutron_simulation import load_stl_mesh, mesh_radius_bounds
+from icf_neutron_simulation import load_stl_mesh
 
 
 def _set_axes_equal(ax: plt.Axes) -> None:
-    """Make 3D axes have equal scale for all directions."""
     limits = np.array(
         [ax.get_xlim3d(), ax.get_ylim3d(), ax.get_zlim3d()],
         dtype=float,
@@ -41,44 +26,53 @@ def _set_axes_equal(ax: plt.Axes) -> None:
     ax.set_zlim3d(centres[2] - half, centres[2] + half)
 
 
-def load_and_prepare_mesh(stl_path: Path, scale: float) -> Tuple[np.ndarray, float, float]:
-    """Load STL, fit radii, and return centred & scaled mesh data."""
+def load_mesh_mm(stl_path: Path) -> np.ndarray:
     mesh = load_stl_mesh(str(stl_path))
-    inner_raw, outer_raw, centre = mesh_radius_bounds(mesh)
-    mesh_centered = mesh - centre[None, None, :]
-    mesh_scaled = mesh_centered * scale
-    inner_radius = inner_raw * scale
-    outer_radius = outer_raw * scale
-    return mesh_scaled, inner_radius, outer_radius
+    if mesh.size == 0:
+        raise ValueError("STL mesh is empty")
+    return mesh
 
 
-def plot_mesh(mesh: np.ndarray, info: str) -> None:
-    """Render the STL mesh with Matplotlib."""
+def mesh_distance_stats_mm(mesh: np.ndarray) -> tuple[float, float]:
+    pts = mesh.reshape(-1, 3)
+    radii = np.linalg.norm(pts, axis=1)
+    return float(np.mean(radii)), float(np.max(radii))
+
+
+def plot_meshes_mm(
+    meshes: list[tuple[np.ndarray, str, tuple[float, float, float, float]]],
+    title: str,
+) -> None:
+    if not meshes:
+        raise ValueError("At least one mesh is required for plotting")
+
     fig = plt.figure(figsize=(8, 8))
     ax = fig.add_subplot(111, projection="3d")
 
-    collection = Poly3DCollection(
-        mesh,
-        facecolor=(0.2, 0.5, 0.9, 0.35),
-        edgecolor=(0.1, 0.1, 0.1, 0.1),
-        linewidths=0.2,
-    )
-    ax.add_collection3d(collection)
+    ax.scatter([0.0], [0.0], [0.0], color="red", s=40, label="Origin")
 
-    # Plot the origin (fitted centre)
-    ax.scatter([0.0], [0.0], [0.0], color="red", s=40, label="Fitted centre")
+    all_points = []
+    for mesh, label, facecolor in meshes:
+        collection = Poly3DCollection(
+            mesh,
+            facecolor=facecolor,
+            edgecolor=(0.1, 0.1, 0.1, 0.1),
+            linewidths=0.2,
+        )
+        collection.set_label(label)
+        ax.add_collection3d(collection)
+        all_points.append(mesh.reshape(-1, 3))
 
-    # Set limits based on mesh extents
-    pts = mesh.reshape(-1, 3)
+    pts = np.concatenate(all_points, axis=0)
     max_range = np.linalg.norm(pts, axis=1).max()
     for setter in (ax.set_xlim3d, ax.set_ylim3d, ax.set_zlim3d):
         setter(-max_range, max_range)
     _set_axes_equal(ax)
 
-    ax.set_xlabel("x (scaled units)")
-    ax.set_ylabel("y (scaled units)")
-    ax.set_zlabel("z (scaled units)")
-    ax.set_title(f"STL Geometry: {info}")
+    ax.set_xlabel("x (mm)")
+    ax.set_ylabel("y (mm)")
+    ax.set_zlabel("z (mm)")
+    ax.set_title(title)
     ax.legend(loc="upper right")
     plt.tight_layout()
     plt.show()
@@ -92,12 +86,6 @@ def parse_args() -> argparse.Namespace:
         default=Path("Target_ball_model.stl"),
         help="Path to the STL file to visualise.",
     )
-    parser.add_argument(
-        "--scale",
-        type=float,
-        default=1.0e-4,
-        help="Scale factor applied to STL coordinates (default converts 0.1 mm to metres).",
-    )
     return parser.parse_args()
 
 
@@ -106,14 +94,34 @@ def main() -> None:
     if not args.stl.exists():
         raise FileNotFoundError(f"Cannot find STL file at {args.stl}")
 
-    mesh_scaled, inner_radius, outer_radius = load_and_prepare_mesh(args.stl, args.scale)
-    thickness = outer_radius - inner_radius
-    info = (
-        f"{args.stl.name} | inner={inner_radius:.4f}, outer={outer_radius:.4f}, "
-        f"thickness={thickness:.4f} (scaled units)"
+    mesh_mm = load_mesh_mm(args.stl)
+    mean_r, max_r = mesh_distance_stats_mm(mesh_mm)
+    primary_info = (
+        f"{args.stl.name} | mean radius={mean_r:.2f} mm, "
+        f"max radius={max_r:.2f} mm"
     )
-    print(info)
-    plot_mesh(mesh_scaled, info)
+    print(primary_info)
+
+    meshes_to_plot: list[tuple[np.ndarray, str, tuple[float, float, float, float]]] = [
+        (mesh_mm, args.stl.name, (0.2, 0.5, 0.9, 0.35)),
+    ]
+    info_lines = [primary_info]
+
+    ntof_path = args.stl.with_name("nTOF.STL")
+    if ntof_path.exists():
+        ntof_mesh_mm = load_mesh_mm(ntof_path)
+        ntof_mean, ntof_max = mesh_distance_stats_mm(ntof_mesh_mm)
+        ntof_info = (
+            f"{ntof_path.name} | mean radius={ntof_mean:.2f} mm, "
+            f"max radius={ntof_max:.2f} mm"
+        )
+        print(ntof_info)
+        info_lines.append(ntof_info)
+        meshes_to_plot.append((ntof_mesh_mm, ntof_path.name, (0.9, 0.35, 0.2, 0.28)))
+    else:
+        print(f"nTOF STL not found at {ntof_path}, skipping overlay.")
+
+    plot_meshes_mm(meshes_to_plot, "\n".join(info_lines))
 
 
 if __name__ == "__main__":
