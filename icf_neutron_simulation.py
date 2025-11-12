@@ -24,13 +24,11 @@ The basic workflow is as follows:
    updated using a simple two‑body kinematic model.  Once the cumulative
    radial distance travelled exceeds the shell thickness or the energy drops
    below 0.1 MeV the neutron leaves the shell or is absorbed, respectively.
-3. **Flight to the scintillator** – After emerging from the shell, the
-   neutron travels in (effectively) vacuum to a scintillator located
-   16 m away.  A square PVC collimating channel of length 16 m and
-   cross-section 1 m × 1 m sits between the target and the detector.  A
-   neutron whose trajectory intersects the channel walls is lost with a
-   high probability (default 99 %); only those that remain within the
-   aperture reach the scintillator.
+3. **Flight through the nTOF channel** – After emerging from the shell, the
+   neutron may intersect the polyethylene structures described by ``nTOF.STL``.
+   If it does, Monte-Carlo collisions with the polyethylene nuclei are simulated
+   using the supplied mean free path; otherwise the neutron travels in vacuum to
+   the scintillator plane 16 m away.
 4. **Energy deposition in the scintillator** – Neutrons that reach the
    scintillator undergo further collisions in the scintillator medium until
    they either deposit most of their energy (E < 0.1 MeV) or escape.
@@ -164,6 +162,18 @@ class MeshGeometry:
     normals: np.ndarray
 
 
+@dataclass
+class DetectorPlane:
+    """Planar detector geometry aligned with an arbitrary axis."""
+
+    axis: np.ndarray
+    u: np.ndarray
+    v: np.ndarray
+    plane_position: float
+    half_u: float
+    half_v: float
+
+
 def prepare_mesh_geometry(mesh: np.ndarray) -> MeshGeometry:
     """Precompute edge vectors and normals for an STL mesh."""
     triangles = np.asarray(mesh, dtype=float)
@@ -237,6 +247,140 @@ def mesh_distance_statistics(mesh: np.ndarray) -> Tuple[float, float]:
     return float(np.mean(radii)), float(np.max(radii))
 
 
+def infer_mesh_axis(mesh: np.ndarray) -> np.ndarray:
+    """Infer the dominant axis of an STL mesh via principal component analysis."""
+    pts = np.asarray(mesh, dtype=float).reshape(-1, 3)
+    if pts.shape[0] < 3:
+        raise ValueError("Not enough vertices to infer mesh axis")
+    centroid = pts.mean(axis=0)
+    centered = pts - centroid
+    _, _, vh = np.linalg.svd(centered, full_matrices=False)
+    axis = vh[0]
+    if np.dot(axis, centroid) < 0.0:
+        axis = -axis
+    norm = np.linalg.norm(axis)
+    if norm == 0.0:
+        return np.array([0.0, 0.0, 1.0])
+    return axis / norm
+
+
+def build_orthonormal_frame(axis: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    axis = np.array(axis, dtype=float)
+    norm = np.linalg.norm(axis)
+    if norm == 0.0:
+        raise ValueError("Axis vector must be non-zero")
+    axis /= norm
+    up = np.array([0.0, 0.0, 1.0])
+    if abs(np.dot(axis, up)) > 0.99:
+        up = np.array([1.0, 0.0, 0.0])
+    u = np.cross(up, axis)
+    u /= np.linalg.norm(u)
+    v = np.cross(axis, u)
+    return axis, u, v
+
+
+def build_detector_plane_from_mesh(
+    mesh: np.ndarray,
+    axis: np.ndarray,
+    tolerance: float = 0.01,
+) -> DetectorPlane:
+    pts = np.asarray(mesh, dtype=float).reshape(-1, 3)
+    axis, u, v = build_orthonormal_frame(axis)
+    projections = pts @ axis
+    plane_position = float(projections.max())
+    mask = projections > plane_position - tolerance
+    subset = pts[mask] if np.any(mask) else pts
+    u_extent = float(np.max(np.abs(subset @ u)))
+    v_extent = float(np.max(np.abs(subset @ v)))
+    u_extent = max(u_extent, 1e-6)
+    v_extent = max(v_extent, 1e-6)
+    return DetectorPlane(axis, u, v, plane_position, u_extent, v_extent)
+
+
+def build_default_detector_plane(distance: float, side: float) -> DetectorPlane:
+    axis, u, v = build_orthonormal_frame(np.array([0.0, 0.0, 1.0]))
+    half = side / 2.0
+    return DetectorPlane(axis, u, v, distance, half, half)
+
+
+def transport_through_slab(
+    energy_mev: float,
+    slab_thickness: float,
+    mean_free_path: float,
+    target_mass_ratio: float,
+    energy_cutoff_mev: float,
+    initial_direction: Optional[np.ndarray] = None,
+) -> Tuple[float, float, np.ndarray]:
+    """Propagate a neutron through a homogeneous slab with multiple scatterings."""
+    remaining = slab_thickness
+    energy = float(energy_mev)
+    cumulative_time = 0.0
+    if initial_direction is not None:
+        current_dir = np.array(initial_direction, dtype=float)
+        norm = np.linalg.norm(current_dir)
+        if norm == 0.0:
+            current_dir = sample_isotropic_direction()
+        else:
+            current_dir /= norm
+    else:
+        current_dir = sample_isotropic_direction()
+    speed = energy_to_speed(energy)
+    while energy > energy_cutoff_mev and remaining > 0.0:
+        free_path = -mean_free_path * math.log(max(1e-12, np.random.rand()))
+        step = min(free_path, remaining)
+        cumulative_time += step / speed
+        remaining -= step
+        if step < free_path:
+            energy = scatter_energy_elastic(energy, target_mass_ratio)
+            current_dir = sample_isotropic_direction()
+            speed = energy_to_speed(energy)
+        else:
+            break
+    return cumulative_time, energy, current_dir
+
+
+def propagate_through_mesh_material(
+    position: np.ndarray,
+    direction: np.ndarray,
+    energy_mev: float,
+    geometry: Optional[MeshGeometry],
+    mean_free_path: float,
+    target_mass_ratio: float,
+    energy_cutoff_mev: float,
+) -> Tuple[float, float, np.ndarray, np.ndarray]:
+    """Advance a neutron through a mesh-defined solid material."""
+    if geometry is None:
+        return 0.0, energy_mev, np.array(position, dtype=float), np.array(direction, dtype=float)
+
+    origin = np.array(position, dtype=float)
+    dir_norm = np.array(direction, dtype=float)
+    dir_norm /= np.linalg.norm(dir_norm)
+    first_hit = ray_mesh_intersection(origin, dir_norm, geometry)
+    if first_hit is None:
+        return 0.0, energy_mev, origin, dir_norm
+
+    entry_dist, entry_point, normal = first_hit
+    speed = energy_to_speed(energy_mev)
+    cumulative_time = entry_dist / speed
+    inside_origin = entry_point + dir_norm * 1e-6
+    exit_hit = ray_mesh_intersection(inside_origin, dir_norm, geometry)
+    if exit_hit is None:
+        return cumulative_time, energy_cutoff_mev, inside_origin, dir_norm
+    path_inside = exit_hit[0]
+    exit_point = inside_origin + dir_norm * path_inside
+
+    slab_time, energy_out, direction_out = transport_through_slab(
+        energy_mev,
+        path_inside,
+        mean_free_path,
+        target_mass_ratio,
+        energy_cutoff_mev,
+        initial_direction=dir_norm,
+    )
+    cumulative_time += slab_time
+    return cumulative_time, energy_out, exit_point, direction_out
+
+
 ################################################################################
 # Sampling utilities
 ################################################################################
@@ -266,23 +410,34 @@ def sample_neutron_energy(mean_mev: float = 2.45, std_mev: float = 0.1) -> float
 
 
 def sample_isotropic_direction() -> np.ndarray:
-    """Generate a random unit vector isotropically distributed on the sphere.
-
-    The method uses the fact that the cosine of the polar angle is uniformly
-    distributed in [−1, 1] and the azimuth is uniformly distributed in
-    [0, 2π].
-
-    Returns
-    -------
-    np.ndarray, shape (3,)
-        A unit vector pointing in a random direction.
-    """
-    z = 2.0 * np.random.rand() - 1.0  # cos(theta) uniformly in [−1,1]
+    """Generate a random unit vector isotropically distributed on the sphere."""
+    z = 2.0 * np.random.rand() - 1.0
     phi = 2.0 * math.pi * np.random.rand()
     r_xy = math.sqrt(max(0.0, 1.0 - z * z))
-    x = r_xy * math.cos(phi)
-    y = r_xy * math.sin(phi)
-    return np.array([x, y, z], dtype=float)
+    return np.array([r_xy * math.cos(phi), r_xy * math.sin(phi), z], dtype=float)
+
+
+def sample_direction_in_cone(
+    axis: np.ndarray,
+    half_angle_deg: float,
+) -> np.ndarray:
+    """Sample a unit vector within a cone of half-angle ``half_angle_deg``."""
+    axis, u, v = build_orthonormal_frame(axis)
+    half_angle_rad = math.radians(half_angle_deg)
+    cos_min = math.cos(half_angle_rad)
+    cos_theta = (1.0 - cos_min) * np.random.rand() + cos_min
+    sin_theta = math.sqrt(max(0.0, 1.0 - cos_theta * cos_theta))
+    phi = 2.0 * math.pi * np.random.rand()
+    local_dir = np.array(
+        [
+            sin_theta * math.cos(phi),
+            sin_theta * math.sin(phi),
+            cos_theta,
+        ],
+        dtype=float,
+    )
+
+    return local_dir[0] * u + local_dir[1] * v + local_dir[2] * axis
 
 
 ################################################################################
@@ -428,22 +583,16 @@ def simulate_in_aluminium(
 
     if mesh_geometry is None:
         # Simple slab approximation when no geometry is supplied.
-        effective_path = shell_thickness
-        current_dir = direction.copy()
-        position = origin.copy()
-        position += current_dir * effective_path
-        remaining_path = effective_path
-        while energy > energy_cutoff_mev and remaining_path > 0.0:
-            free_path = -mean_free_path * math.log(max(1e-12, np.random.rand()))
-            step_length = min(free_path, remaining_path)
-            cumulative_time += step_length / speed
-            remaining_path -= step_length
-            if step_length < free_path:
-                energy = scatter_energy_elastic(energy, target_mass_ratio)
-                current_dir = sample_isotropic_direction()
-                speed = energy_to_speed(energy)
-            else:
-                break
+        slab_time, energy, current_dir = transport_through_slab(
+            energy,
+            shell_thickness,
+            mean_free_path,
+            target_mass_ratio,
+            energy_cutoff_mev,
+            initial_direction=direction,
+        )
+        cumulative_time += slab_time
+        position = origin + direction * shell_thickness
         return cumulative_time, energy, current_dir, position
 
     # Detailed treatment using STL geometry
@@ -523,21 +672,15 @@ def propagate_to_scintillator(
     position: np.ndarray,
     direction: np.ndarray,
     energy_mev: float,
-    distance_to_detector: float = 16.0,
-    detector_side: float = 1.0,
-    collimator_absorption: float = 0.99,
+    detector_plane: DetectorPlane,
     energy_cutoff_mev: float = 0.1,
 ) -> Tuple[Optional[float], Optional[np.ndarray]]:
     """Propagate a neutron from the shell exit to the scintillator.
 
-    The scintillator is modelled as a square detector of side length
-    ``detector_side`` located a distance ``distance_to_detector`` metres away
-    along the +z axis from the source centre.  Between the source and detector
-    is a square PVC collimating channel of the same cross-section.  A neutron
-    starting from ``position`` must travel entirely within the channel aperture
-    to reach the scintillator; should it strike the channel wall it is absorbed
-    with probability ``collimator_absorption`` (default 99 %).  Rare survivors
-    are assumed to continue along their original trajectory.
+    The scintillator is modelled as a planar rectangle oriented along
+    ``detector_plane.axis``.  Once the neutron exits the polyethylene channel
+    it travels in vacuum straight to this plane; a hit is recorded only if the
+    intersection falls within the detector area.
 
     Parameters
     ----------
@@ -547,14 +690,8 @@ def propagate_to_scintillator(
         Unit vector giving the direction of motion leaving the aluminium shell.
     energy_mev : float
         Kinetic energy in MeV when leaving the aluminium shell.
-    distance_to_detector : float, optional
-        Distance from the neutron source (shell centre) to the scintillator
-        surface in metres.  Defaults to 16 m.
-    detector_side : float, optional
-        Side length of the square scintillator in metres.  Defaults to 1 m.
-    collimator_absorption : float, optional
-        Probability that a neutron striking the collimator is absorbed.  The
-        default value of 0.99 corresponds to a 99 % absorption probability.
+    detector_plane : DetectorPlane
+        Geometry describing the scintillator plane.
     energy_cutoff_mev : float, optional
         Energies below this threshold are considered lost.  If a neutron has
         too little energy to travel the full distance, it is discarded.
@@ -565,8 +702,8 @@ def propagate_to_scintillator(
         If the neutron reaches the scintillator, ``flight_time`` is the time
         (s) spent in flight from the shell exit to the scintillator, and
         ``hit_point`` is the 3‑D position on the detector plane where it
-        arrives.  If the neutron misses the detector or is absorbed in the
-        collimator, both return values are ``None``.
+        arrives.  If the neutron misses the detector, both return values are
+        ``None``.
     """
     # Normalise direction to ensure it is a unit vector
     pos = np.array(position, dtype=float)
@@ -584,61 +721,26 @@ def propagate_to_scintillator(
         return None, None
 
     speed = energy_to_speed(energy_mev)
-    half_size = detector_side / 2.0
+    axis = detector_plane.axis
+    u = detector_plane.u
+    v = detector_plane.v
+    plane_pos = detector_plane.plane_position
 
-    flight_time = 0.0
+    dir_dot = float(np.dot(d, axis))
+    if dir_dot <= 0.0:
+        return None, None
 
-    # Move to the start of the collimator (z = 0) if the neutron exits behind it.
-    if pos[2] < 0.0:
-        t_entry = (0.0 - pos[2]) / d[2]
-        if t_entry < 0.0:
-            return None, None
-        flight_time += t_entry / speed
-        pos = pos + d * t_entry
-
-    # Check if the entry point lies within the channel aperture.
-    if abs(pos[0]) > half_size or abs(pos[1]) > half_size:
-        if np.random.rand() < collimator_absorption:
-            return None, None
-        pos[0] = max(min(pos[0], half_size), -half_size)
-        pos[1] = max(min(pos[1], half_size), -half_size)
-
-    # Determine potential wall intersections along the remaining path.
-    def _wall_hit_z(component: float, slope: float) -> Optional[float]:
-        if abs(slope) < 1e-12:
-            return None
-        hits: List[float] = []
-        for sign in (-1.0, 1.0):
-            numerator = sign * half_size - component
-            z_hit = pos[2] + numerator / slope
-            if z_hit > pos[2] + 1e-9 and z_hit < distance_to_detector - 1e-9:
-                hits.append(z_hit)
-        if not hits:
-            return None
-        return min(hits)
-
-    slope_x = d[0] / d[2]
-    slope_y = d[1] / d[2]
-    wall_candidates = [z for z in (_wall_hit_z(pos[0], slope_x), _wall_hit_z(pos[1], slope_y)) if z is not None]
-    z_wall = min(wall_candidates) if wall_candidates else None
-
-    if z_wall is not None:
-        distance_to_wall = (z_wall - pos[2]) / d[2]
-        if distance_to_wall > 0.0:
-            flight_time += distance_to_wall / speed
-            pos = pos + d * distance_to_wall
-        if np.random.rand() < collimator_absorption:
-            return None, None
-
-    # Propagate to the detector plane (z = distance_to_detector).
-    t_total = (distance_to_detector - pos[2]) / d[2]
+    t_total = (plane_pos - float(np.dot(pos, axis))) / dir_dot
     if t_total <= 0.0:
         return None, None
+
     hit = pos + d * t_total
-    if abs(hit[0]) > half_size or abs(hit[1]) > half_size:
+    u_coord = float(np.dot(hit, u))
+    v_coord = float(np.dot(hit, v))
+    if abs(u_coord) > detector_plane.half_u or abs(v_coord) > detector_plane.half_v:
         return None, None
 
-    flight_time += t_total / speed
+    flight_time = t_total / speed
     return flight_time, hit
 
 
@@ -725,15 +827,20 @@ def simulate_neutron_history(
     scintillator_mass_ratio: float,
     detector_distance: float = 16.0,
     detector_side: float = 1.0,
-    collimator_absorption: float = 0.99,
     energy_cutoff_mev: float = 0.1,
     shell_geometry: Optional[MeshGeometry] = None,
+    channel_geometry: Optional[MeshGeometry] = None,
+    channel_mfp: float = 0.0602,
+    channel_mass_ratio: float = 1.0,
+    source_cone_axis: Optional[np.ndarray] = None,
+    source_cone_half_angle_deg: float = 15.0,
+    detector_plane: Optional[DetectorPlane] = None,
 ) -> Optional[float]:
     """Simulate the complete history of a single neutron.
 
     This function ties together all the individual stages: generation at the
-    target centre, transport through the aluminium shell, propagation through
-    the collimator, and final slowing down in the scintillator.  If the
+    target centre, transport through the aluminium shell, interaction with the
+    polyethylene channel, and final slowing down in the scintillator.  If the
     neutron survives to deposit energy in the scintillator, the function
     returns its total time‑of‑flight (source to detector).  Otherwise it
     returns ``None`` to indicate that the neutron was lost or absorbed.
@@ -753,18 +860,30 @@ def simulate_neutron_history(
     scintillator_mass_ratio : float
         Mass ratio of the dominant scattering nucleus in the scintillator.
     detector_distance : float, optional
-        Distance from the target to the scintillator (m).  Defaults to 16 m.
+        Distance from the target to the scintillator (m).  Used only when
+        ``detector_plane`` is ``None``.  Defaults to 16 m.
     detector_side : float, optional
-        Side length of the square scintillator (m).  Defaults to 1 m.
-    collimator_absorption : float, optional
-        Fraction of neutrons absorbed in the collimating channel.  Defaults
-        to 0.99 (99 % absorption).
+        Side length of the square scintillator (m) for the fallback detector
+        geometry.  Defaults to 1 m.
     energy_cutoff_mev : float, optional
         Energy threshold below which neutrons are considered absorbed.
     shell_geometry : MeshGeometry, optional
         Preprocessed STL data.  When provided the simulation respects the shell
         openings described by the mesh.  If ``None``, a spherical approximation
         is used.
+    channel_geometry : MeshGeometry, optional
+        STL geometry describing the polyethylene channel.
+    channel_mfp : float, optional
+        Mean free path in polyethylene (m).  Defaults to 0.0602 m.
+    channel_mass_ratio : float, optional
+        Mass ratio of the dominant scattering nucleus in polyethylene.
+    source_cone_axis : np.ndarray, optional
+        Axis of the emission cone.  When ``None`` the emission is isotropic.
+    source_cone_half_angle_deg : float, optional
+        Half-angle (degrees) of the emission cone.  Defaults to 15°.
+    detector_plane : DetectorPlane, optional
+        Explicit detector geometry.  When ``None`` a square detector located
+        ``detector_distance`` metres along ``+z`` is used.
 
     Returns
     -------
@@ -774,9 +893,14 @@ def simulate_neutron_history(
     """
     # 1. Generate initial energy and direction
     E0 = sample_neutron_energy()
-    d0 = sample_isotropic_direction()
+    if source_cone_axis is None:
+        d0 = sample_isotropic_direction()
+    else:
+        d0 = sample_direction_in_cone(source_cone_axis, source_cone_half_angle_deg)
 
     # 2. Transport through the aluminium shell
+    detector_plane = detector_plane or build_default_detector_plane(detector_distance, detector_side)
+
     t_shell, E_after_shell, d_after_shell, pos_after_shell = simulate_in_aluminium(
         d0,
         E0,
@@ -790,22 +914,33 @@ def simulate_neutron_history(
     if E_after_shell <= energy_cutoff_mev:
         return None
 
-    # 3. Flight to the scintillator with collimator losses
-    flight_time, hit_point = propagate_to_scintillator(
+    # 3. Interaction with the polyethylene channel
+    t_channel, E_after_channel, pos_after_channel, d_after_channel = propagate_through_mesh_material(
         pos_after_shell,
         d_after_shell,
         E_after_shell,
-        distance_to_detector=detector_distance,
-        detector_side=detector_side,
-        collimator_absorption=collimator_absorption,
+        channel_geometry,
+        channel_mfp,
+        channel_mass_ratio,
+        energy_cutoff_mev,
+    )
+    if E_after_channel <= energy_cutoff_mev:
+        return None
+
+    # 4. Flight to the scintillator
+    flight_time, hit_point = propagate_to_scintillator(
+        pos_after_channel,
+        d_after_channel,
+        E_after_channel,
+        detector_plane,
         energy_cutoff_mev=energy_cutoff_mev,
     )
     if flight_time is None:
         return None
 
-    # 4. Energy deposition in the scintillator
+    # 5. Energy deposition in the scintillator
     t_scin, E_after_scin = simulate_in_scintillator(
-        E_after_shell,
+        E_after_channel,
         scintillator_thickness,
         scintillator_mfp,
         scintillator_mass_ratio,
@@ -814,7 +949,7 @@ def simulate_neutron_history(
     # The neutron is considered to contribute to the signal regardless of
     # whether it is absorbed or escapes from the scintillator; the TOF is
     # measured at the moment of first interaction.
-    return t_shell + flight_time + t_scin
+    return t_shell + t_channel + flight_time + t_scin
 
 
 def run_simulation(
@@ -827,9 +962,14 @@ def run_simulation(
     scintillator_mass_ratio: float,
     detector_distance: float = 16.0,
     detector_side: float = 1.0,
-    collimator_absorption: float = 0.99,
     energy_cutoff_mev: float = 0.1,
     shell_geometry: Optional[MeshGeometry] = None,
+    channel_geometry: Optional[MeshGeometry] = None,
+    channel_mfp: float = 0.0602,
+    channel_mass_ratio: float = 1.0,
+    source_cone_axis: Optional[np.ndarray] = None,
+    source_cone_half_angle_deg: float = 15.0,
+    detector_plane: Optional[DetectorPlane] = None,
 ) -> List[float]:
     """Simulate multiple neutrons and return their time‑of‑flight values.
 
@@ -863,9 +1003,14 @@ def run_simulation(
             scintillator_mass_ratio,
             detector_distance,
             detector_side,
-            collimator_absorption,
             energy_cutoff_mev,
             shell_geometry=shell_geometry,
+            channel_geometry=channel_geometry,
+            channel_mfp=channel_mfp,
+            channel_mass_ratio=channel_mass_ratio,
+            source_cone_axis=source_cone_axis,
+            source_cone_half_angle_deg=source_cone_half_angle_deg,
+            detector_plane=detector_plane,
         )
         if tof is not None:
             tof_values.append(tof)
@@ -888,10 +1033,16 @@ if __name__ == "__main__":
         print(f"[info] Using STL file: {stl_file_path.name}")
 
     shell_mesh = load_stl_mesh(str(stl_file_path))
+    channel_mesh_path = base_dir / "nTOF.STL"
+    channel_mesh = load_stl_mesh(str(channel_mesh_path))
     unit_scale = 1.0e-3  # Convert millimetres to metres
     mesh_scaled = shell_mesh * unit_scale
+    channel_scaled = channel_mesh * unit_scale
     shell_geometry = prepare_mesh_geometry(mesh_scaled)
+    channel_geometry = prepare_mesh_geometry(channel_scaled)
     mean_radius, max_radius = mesh_distance_statistics(mesh_scaled)
+    channel_axis = infer_mesh_axis(channel_scaled)
+    detector_plane = build_detector_plane_from_mesh(channel_scaled, channel_axis)
 
     shell_thickness = 0.08  # metres (given design thickness)
 
@@ -900,14 +1051,24 @@ if __name__ == "__main__":
         f"[info] STL vertex distances: mean={mean_radius:.4f} m, "
         f"max={max_radius:.4f} m"
     )
+    print(f"[info] Inferred channel axis: {channel_axis}")
+    print(
+        "[info] Detector plane: position={:.4f} m, half-sizes=({:.4f}, {:.4f}) m".format(
+            detector_plane.plane_position,
+            detector_plane.half_u,
+            detector_plane.half_v,
+        )
+    )
 
     # Simulation parameters (adjust as needed)
     n_neutrons = 1000
-    aluminium_mfp = 0.002  # Mean free path in aluminium (m)
+    aluminium_mfp = 0.0694  # 6.94 cm mean free path in aluminium
     scintillator_thickness = 0.05  # Scintillator thickness (m)
     scintillator_mfp = 0.01  # Mean free path in the scintillator (m)
     aluminium_mass_ratio = 26.98  # Mass ratio A for aluminium
     scintillator_mass_ratio = 1.0  # Dominant scattering nucleus (hydrogen)
+    channel_mfp = 0.0602  # 6.02 cm in polyethylene
+    channel_mass_ratio = 1.0
 
     tof_list = run_simulation(
         n_neutrons=n_neutrons,
@@ -919,13 +1080,15 @@ if __name__ == "__main__":
         scintillator_mass_ratio=scintillator_mass_ratio,
         detector_distance=16.0,
         detector_side=1.0,
-        collimator_absorption=0.99,
         energy_cutoff_mev=0.1,
         shell_geometry=shell_geometry,
+        channel_geometry=channel_geometry,
+        channel_mfp=channel_mfp,
+        channel_mass_ratio=channel_mass_ratio,
+        source_cone_axis=channel_axis,
+        detector_plane=detector_plane,
     )
 
     print(f"Simulated {len(tof_list)} neutrons reaching the scintillator out of {n_neutrons}")
     if tof_list:
         print(f"Mean time of flight: {np.mean(tof_list):.3e} s")
-    for tof in tof_list:
-        print(f"{tof:.6e}")
