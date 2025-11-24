@@ -51,6 +51,12 @@ from typing import Iterable, List, Optional, Tuple
 
 import numpy as np
 
+
+# 阿伏伽德罗常数 (mol⁻¹)
+AVOGADRO_CONSTANT = 6.02214076e23 
+# barn 到 m² 的转换 (1 barn = 1e-28 m²)
+BARN_TO_M2 = 1.0e-28
+
 ################################################################################
 # STL handling
 ################################################################################
@@ -306,7 +312,7 @@ def build_default_detector_plane(distance: float, side: float) -> DetectorPlane:
 def transport_through_slab(
     energy_mev: float,
     slab_thickness: float,
-    mean_free_path: float,
+    mfp_data: np.ndarray, # 修改: 传入 MFP 数据数组
     target_mass_ratio: float,
     energy_cutoff_mev: float,
     initial_direction: Optional[np.ndarray] = None,
@@ -315,6 +321,8 @@ def transport_through_slab(
     remaining = slab_thickness
     energy = float(energy_mev)
     cumulative_time = 0.0
+
+    # 初始化方向和速度
     if initial_direction is not None:
         current_dir = np.array(initial_direction, dtype=float)
         norm = np.linalg.norm(current_dir)
@@ -324,16 +332,24 @@ def transport_through_slab(
             current_dir /= norm
     else:
         current_dir = sample_isotropic_direction()
+
     speed = energy_to_speed(energy)
+
+    # --- 在循环开始前计算当前的 MFP ---
+    mean_free_path = get_mfp_energy_dependent(energy,mfp_data)
+
+
     while energy > energy_cutoff_mev and remaining > 0.0:
         free_path = -mean_free_path * math.log(max(1e-12, np.random.rand()))
         step = min(free_path, remaining)
         cumulative_time += step / speed
         remaining -= step
+
         if step < free_path:
             energy = scatter_energy_elastic(energy, target_mass_ratio)
             current_dir = sample_isotropic_direction()
             speed = energy_to_speed(energy)
+            mean_free_path = get_mfp_energy_dependent(energy, mfp_data)
         else:
             break
     return cumulative_time, energy, current_dir
@@ -517,14 +533,223 @@ def scatter_energy_elastic(neutron_energy_mev: float, target_mass_ratio: float) 
 
 
 ################################################################################
-# Transport through the aluminium shell
+# Data Loading Utilities
 ################################################################################
 
+def load_mfp_data_from_csv(file_path: str) -> np.ndarray:
+    """
+    Load macro-scopic cross section data from a two-column CSV file.
+
+    The file must contain data pairs: [Energy (MeV), Sigma_Macro (m⁻¹)].
+    The function handles conversion and ensures the data is sorted by energy.
+
+    Parameters
+    ----------
+    file_path : str
+        Path to the CSV file on disk containing the cross section data.
+
+    Returns
+    -------
+    np.ndarray, shape (N, 2)
+        Sorted array of [Energy, Sigma_Macro].
+    """
+    if not os.path.isfile(file_path):
+        raise FileNotFoundError(f"Cross section data file '{file_path}' does not exist.")
+
+    try:
+        # NOTE: Updated to handle ';' delimiter and skip potential header lines.
+        # We assume the energy is in the first column (index 0) 
+        # and the macroscopic cross section (Sigma_Macro) is in the second column (index 1), 
+        # based on the header structure provided.
+        # We load only columns 0 and 1.
+        
+        # Determine the number of header rows to skip (assuming non-numeric lines)
+        skip_rows = 0
+        with open(file_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                try:
+                    # Try to parse the first value as float. If it fails, it's likely a header.
+                    float(line.split(';')[0])
+                    break
+                except ValueError:
+                    skip_rows += 1
+                if skip_rows > 3: # Avoid infinite loop on corrupt files
+                    break
+
+        data = np.loadtxt(
+            file_path, 
+            delimiter=';', 
+            skiprows=skip_rows, 
+            usecols=(0, 1), # 使用第0列(Energy)和第1列(Sigma_Macro)
+            dtype=float
+        )
+        
+        # JANIS/ENDF data often uses large energy units (e.g., eV). 
+        # Assuming the first column is in eV, we convert it to MeV for consistency.
+        # This conversion step is critical if the source data is not already in MeV.
+        data[:, 0] = data[:, 0] * 1e-6 
+        
+    except Exception as e:
+        raise ValueError(f"Could not load and process data from CSV: {e}")
+
+    if data.ndim != 2 or data.shape[1] != 2:
+        raise ValueError("Processed data must contain exactly two columns: Energy (MeV) and Macro-Sigma (m⁻¹).")
+
+    # Ensure data is sorted by Energy for correct interpolation
+    data = data[data[:, 0].argsort()]
+    return data[:, :2]
+
+
+def calculate_pe_macro_sigma(
+    h_micro_data: np.ndarray,
+    c_micro_data: np.ndarray,
+    density_g_cm3: float = 0.92,
+) -> np.ndarray:
+    """
+    Calculates the macroscopic cross section for Polyethylene (C₂H₄) 
+    by combining Hydrogen (H) and Carbon (C) micro-sections.
+
+    Assumes H and C data arrays contain micro-sections (sigma) in BARN.
+    
+    PE molar mass (C₂H₄): M_PE = 2 * M_C + 4 * M_H ≈ 28.05 g/mol.
+    
+    Macro-section Sigma = N_i * sigma_i(E).
+
+    Parameters
+    ----------
+    h_micro_data : np.ndarray
+        [Energy (MeV), Sigma_Micro (barn)] data for Hydrogen.
+    c_micro_data : np.ndarray
+        [Energy (MeV), Sigma_Micro (barn)] data for Carbon.
+    density_g_cm3 : float, optional
+        Density of polyethylene (g/cm³).
+
+    Returns
+    -------
+    np.ndarray, shape (N, 2)
+        Combined [Energy (MeV), Sigma_Macro_PE (m⁻¹)].
+    """
+    
+    # 1. PE 物理常数
+    M_C = 12.011  # g/mol
+    M_H = 1.008  # g/mol
+    M_PE = 2 * M_C + 4 * M_H  # ≈ 28.05 g/mol (C₂H₄)
+    
+    # 2. 计算原子核数密度 N_i (m⁻³)
+    # N_i = (rho * N_A * n_i) / M_PE
+    rho_kg_m3 = density_g_cm3 * 1000 # kg/m³ (或保持 g/cm³, 最终单位调整)
+    
+    # 我们使用 M_PE (g/mol) 和 rho (g/cm³) 进行计算，最终转换为 m⁻³
+    # N_i (cm⁻³) = (rho_g_cm3 * N_A * n_i) / M_PE
+    # N_i (m⁻³) = N_i (cm⁻³) * 1e6
+    
+    N_C_cm3 = (density_g_cm3 * AVOGADRO_CONSTANT * 2) / M_PE
+    N_H_cm3 = (density_g_cm3 * AVOGADRO_CONSTANT * 4) / M_PE
+    
+    N_C_m3 = N_C_cm3 * 1e6
+    N_H_m3 = N_H_cm3 * 1e6
+
+    # 3. 创建统一的能量网格
+    all_energies = np.unique(np.concatenate([h_micro_data[:, 0], c_micro_data[:, 0]]))
+    
+    # 4. 插值微观截面 (Sigma_Micro) 到统一网格
+    sigma_h_interp_barn = np.interp(all_energies, h_micro_data[:, 0], h_micro_data[:, 1])
+    sigma_c_interp_barn = np.interp(all_energies, c_micro_data[:, 0], c_micro_data[:, 1])
+    
+    # 5. 计算最终的宏观截面 Sigma_Macro (m⁻¹)
+    # Sigma_Macro (m⁻¹) = N_i (m⁻³) * sigma_i (m²)
+    # Sigma_Macro (m⁻¹) = N_i (m⁻³) * sigma_i (barn) * BARN_TO_M2
+    
+    sigma_pe_total_m1 = (
+        N_C_m3 * sigma_c_interp_barn * BARN_TO_M2 +
+        N_H_m3 * sigma_h_interp_barn * BARN_TO_M2
+    )
+    
+    # 6. 组成新的数据数组
+    pe_macro_data = np.stack([all_energies, sigma_pe_total_m1], axis=1)
+    
+    return pe_macro_data
+
+
+################################################################################
+# Energy-dependent MFP utility (UPDATED FUNCTION)
+################################################################################
+
+# 示例数据结构: 预设的宏观截面数据（能量 [MeV] -> 宏观截面 [m⁻¹]）
+# 注意：这些数据需要根据材料密度和真实核数据计算得到。
+# 聚乙烯 (C₂H₄, 密度 ≈ 0.92 g/cm³)
+MFP_DATA_PE = np.array([
+    [0.1, 15.0],  # 0.1 MeV 时的宏观截面 (m⁻¹)
+    [0.5, 13.5],
+    [1.0, 10.0],
+    [2.45, 16.6], # 2.45 MeV 基准点
+    [5.0, 17.5],
+    [10.0, 18.0],
+    [14.1, 17.8], # D-T 中子能量
+])
+
+# 铝 (Al, 密度 ≈ 2.70 g/cm³)
+MFP_DATA_AL = np.array([
+    [0.1, 10.0],
+    [0.5, 11.2],
+    [1.0, 13.0],
+    [2.45, 14.4], # 2.45 MeV 基准点
+    [5.0, 15.5],
+    [10.0, 16.0],
+    [14.1, 16.2],
+])
+
+
+def get_mfp_energy_dependent(
+    energy_mev: float,
+    mfp_data: np.ndarray,
+) -> float:
+    """
+    根据中子能量计算平均自由程（MFP），使用线性插值。
+
+    参数
+    ----------
+    energy_mev : float
+        中子的当前动能 (MeV)。
+    mfp_data : np.ndarray
+        预设的 [能量 (MeV), 宏观截面 (m⁻¹)] 数据对数组。
+
+    返回
+    -------
+    float
+        新的平均自由程 (m)。
+    """
+    if energy_mev <= 0.0:
+        return 1e12  # 能量为零，视为停止（无限大 MFP，但实际会被截止）
+
+    energies = mfp_data[:, 0]
+    sigmas = mfp_data[:, 1]
+    
+    # 确保能量在插值范围内，否则使用边界值（常数外插）
+    if energy_mev < energies.min():
+        sigma = sigmas[0]
+    elif energy_mev > energies.max():
+        sigma = sigmas[-1]
+    else:
+        # 使用线性插值计算宏观截面 sigma (m⁻¹)
+        sigma = np.interp(energy_mev, energies, sigmas)
+
+    # MFP = 1 / Sigma。确保 Sigma 不为零。
+    if sigma <= 1e-12:
+        return 1e12  # 如果宏观截面为零，MFP 视为无限大
+        
+    # 返回 MFP (m)
+    return 1.0 / sigma
+
+
+################################################################################
+# Transport through the aluminium shell
+################################################################################
 def simulate_in_aluminium(
     direction: np.ndarray,
     energy_mev: float,
     shell_thickness: float,
-    mean_free_path: float,
+    aluminium_mfp_data: np.ndarray, # 修改: 传入 MFP 数据数组
     target_mass_ratio: float,
     energy_cutoff_mev: float = 0.1,
     mesh_geometry: Optional[MeshGeometry] = None,
@@ -586,7 +811,7 @@ def simulate_in_aluminium(
         slab_time, energy, current_dir = transport_through_slab(
             energy,
             shell_thickness,
-            mean_free_path,
+            aluminium_mfp_data, # 传入数据数组
             target_mass_ratio,
             energy_cutoff_mev,
             initial_direction=direction,
@@ -606,6 +831,8 @@ def simulate_in_aluminium(
     if normal_len > 0.0:
         normal = normal / normal_len
     cos_incident = float(np.dot(direction, normal))
+
+    # Ensure neutron is travelling towards the slab (positive dot product with normal)
     if cos_incident <= 0.0:
         normal = -normal
         cos_incident = -cos_incident
@@ -615,53 +842,24 @@ def simulate_in_aluminium(
     distance_to_entry = max(distance_to_outer - path_length_along_direction, 0.0)
     cumulative_time += distance_to_entry / speed
     position = origin + direction * distance_to_entry
-    depth = 0.0  # distance travelled along +normal from inner surface
-
-    EPS = 1e-9
-    position += direction * EPS
-    depth += EPS * cos_incident
-
-    current_dir = direction.copy()
-    exit_position = position.copy()
-
-    while energy > energy_cutoff_mev:
-        free_path = -mean_free_path * math.log(max(1e-12, np.random.rand()))
-        dot = float(np.dot(current_dir, normal))
-        travel = free_path
-        boundary = None
-
-        if dot > 1e-9:
-            dist_outer = (shell_thickness - depth) / dot
-            dist_outer = max(dist_outer, 0.0)
-            if dist_outer <= free_path:
-                travel = dist_outer
-                boundary = "outer"
-        elif dot < -1e-9:
-            dist_inner = -depth / dot
-            dist_inner = max(dist_inner, 0.0)
-            if dist_inner <= free_path:
-                travel = dist_inner
-                boundary = "inner"
-
-        if travel > 0.0:
-            position = position + current_dir * travel
-            cumulative_time += travel / speed
-            depth += travel * dot
-            depth = min(max(depth, 0.0), shell_thickness)
-
-        if boundary == "outer":
-            exit_position = position.copy()
-            return cumulative_time, energy, current_dir, exit_position
-        if boundary == "inner":
-            # Returned to the cavity; treat as leaving the shell inward.
-            return cumulative_time, energy, current_dir, position
-
-        # Collision within aluminium
-        energy = scatter_energy_elastic(energy, target_mass_ratio)
-        current_dir = sample_isotropic_direction()
-        speed = energy_to_speed(energy)
-
-    return cumulative_time, energy, current_dir, position
+    
+    
+    # Slab simulation inside the mesh material
+    # We call transport_through_slab to simulate the interaction in the slab material
+    slab_time, energy_out, direction_out = transport_through_slab(
+        energy_mev,
+        path_length_along_direction, # 使用沿方向的路径长度作为 Slab 厚度
+        aluminium_mfp_data, # 传入数据数组
+        aluminium_mass_ratio,
+        energy_cutoff_mev,
+        initial_direction=direction,
+    )
+    
+    # Compute exit point based on initial direction and total path length
+    cumulative_time += slab_time
+    exit_point = position + direction * path_length_along_direction
+    
+    return cumulative_time, energy_out, direction_out, exit_point
 
 
 ################################################################################
@@ -751,7 +949,7 @@ def propagate_to_scintillator(
 def simulate_in_scintillator(
     energy_mev: float,
     scintillator_thickness: float,
-    mean_free_path: float,
+    scintillator_mfp_data: np.ndarray, # 修改: 传入 MFP 数据数组
     target_mass_ratio: float,
     energy_cutoff_mev: float = 0.1,
 ) -> Tuple[float, float]:
@@ -797,20 +995,27 @@ def simulate_in_scintillator(
     cumulative_distance = 0.0
     cumulative_time = 0.0
     speed = energy_to_speed(energy)
+    mean_free_path = get_mfp_energy_dependent(energy,scintillator_mfp_data,)
+
     while energy > energy_cutoff_mev and cumulative_distance < scintillator_thickness:
         free_path = -mean_free_path * math.log(max(1e-12, np.random.rand()))
         remaining = scintillator_thickness - cumulative_distance
         step = min(free_path, remaining)
         cumulative_time += step / speed
         cumulative_distance += step
+
         if cumulative_distance >= scintillator_thickness:
             break
         # Scatter – energy update and isotropic direction.  For simplicity the
         # direction within the scintillator is irrelevant to the time since
         # the mean free path is isotropic; if one wanted to compute spatial
         # escape probabilities the direction would need to be tracked.
+
+        # 碰撞发生
         energy = scatter_energy_elastic(energy, target_mass_ratio)
         speed = energy_to_speed(energy)
+        mean_free_path = get_mfp_energy_dependent(energy,scintillator_mfp_data)
+
     return cumulative_time, energy
 
 
@@ -820,17 +1025,17 @@ def simulate_in_scintillator(
 
 def simulate_neutron_history(
     shell_thickness: float,
-    aluminium_mfp: float,
+    aluminium_mfp_data: np.ndarray, # 修改: 传入 MFP 数据数组
     aluminium_mass_ratio: float,
     scintillator_thickness: float,
-    scintillator_mfp: float,
+    scintillator_mfp_data: np.ndarray, # 修改: 传入 MFP 数据数组
     scintillator_mass_ratio: float,
     detector_distance: float = 16.0,
     detector_side: float = 1.0,
     energy_cutoff_mev: float = 0.1,
     shell_geometry: Optional[MeshGeometry] = None,
     channel_geometry: Optional[MeshGeometry] = None,
-    channel_mfp: float = 0.0602,
+    channel_mfp_data: np.ndarray = MFP_DATA_PE, # 修改: 传入 MFP 数据数组
     channel_mass_ratio: float = 1.0,
     source_cone_axis: Optional[np.ndarray] = None,
     source_cone_half_angle_deg: float = 15.0,
@@ -905,7 +1110,7 @@ def simulate_neutron_history(
         d0,
         E0,
         shell_thickness,
-        aluminium_mfp,
+        aluminium_mfp_data, # 传入数据数组
         aluminium_mass_ratio,
         energy_cutoff_mev,
         mesh_geometry=shell_geometry,
@@ -920,7 +1125,7 @@ def simulate_neutron_history(
         d_after_shell,
         E_after_shell,
         channel_geometry,
-        channel_mfp,
+        channel_mfp_data, # 传入数据数组
         channel_mass_ratio,
         energy_cutoff_mev,
     )
@@ -942,7 +1147,7 @@ def simulate_neutron_history(
     t_scin, E_after_scin = simulate_in_scintillator(
         E_after_channel,
         scintillator_thickness,
-        scintillator_mfp,
+        scintillator_mfp_data, # 传入数据数组
         scintillator_mass_ratio,
         energy_cutoff_mev,
     )
@@ -955,17 +1160,17 @@ def simulate_neutron_history(
 def run_simulation(
     n_neutrons: int,
     shell_thickness: float,
-    aluminium_mfp: float,
     aluminium_mass_ratio: float,
     scintillator_thickness: float,
-    scintillator_mfp: float,
     scintillator_mass_ratio: float,
+    scintillator_mfp_data: np.ndarray = MFP_DATA_PE,
+    aluminium_mfp_data: np.ndarray = MFP_DATA_AL,
     detector_distance: float = 16.0,
     detector_side: float = 1.0,
     energy_cutoff_mev: float = 0.1,
     shell_geometry: Optional[MeshGeometry] = None,
     channel_geometry: Optional[MeshGeometry] = None,
-    channel_mfp: float = 0.0602,
+    channel_mfp_data: np.ndarray = MFP_DATA_PE,
     channel_mass_ratio: float = 1.0,
     source_cone_axis: Optional[np.ndarray] = None,
     source_cone_half_angle_deg: float = 15.0,
@@ -996,17 +1201,17 @@ def run_simulation(
     for _ in range(n_neutrons):
         tof = simulate_neutron_history(
             shell_thickness,
-            aluminium_mfp,
+            aluminium_mfp_data,
             aluminium_mass_ratio,
             scintillator_thickness,
-            scintillator_mfp,
+            scintillator_mfp_data,
             scintillator_mass_ratio,
             detector_distance,
             detector_side,
             energy_cutoff_mev,
             shell_geometry=shell_geometry,
             channel_geometry=channel_geometry,
-            channel_mfp=channel_mfp,
+            channel_mfp_data=channel_mfp_data,
             channel_mass_ratio=channel_mass_ratio,
             source_cone_axis=source_cone_axis,
             source_cone_half_angle_deg=source_cone_half_angle_deg,
@@ -1017,8 +1222,54 @@ def run_simulation(
     return tof_values
 
 
+########################################################################################################
+#################################################### main code ####################################################
+########################################################################################################
 if __name__ == "__main__":
     base_dir = Path(__file__).resolve().parent
+
+    AL_CSV_FILE = base_dir / "Al.csv" 
+    H_CSV_FILE = base_dir / "H.csv" 
+    C_CSV_FILE = base_dir / "C.csv" 
+    
+    # --- KERNEL SETUP ---
+    # 1. 尝试加载用户提供的铝截面数据
+    try:
+        if AL_CSV_FILE.exists():
+            # 使用新的加载函数加载真实数据
+            aluminium_mfp_data = load_mfp_data_from_csv(str(AL_CSV_FILE))
+            print(f"[info] Successfully loaded energy-dependent MFP data for Aluminium from {AL_CSV_FILE.name}")
+        else:
+            # 如果文件不存在，则退回使用占位符
+            aluminium_mfp_data = MFP_DATA_AL
+            print("[info] Using default internal MFP data for Aluminium.")
+    except Exception as e:
+        print(f"[warning] Failed to load custom Aluminium MFP data. Using default. Error: {e}")
+        aluminium_mfp_data = MFP_DATA_AL
+
+    # --- 2. 聚乙烯数据计算 (用于 Channel 和 Scintillator) ---
+    try:
+        if H_CSV_FILE.exists() and C_CSV_FILE.exists():
+            # 加载 H 和 C 的微观截面数据 (假设 use_cols=(0, 2) 对应 [Energy, Micro_Sigma (barn)])
+            h_micro_data = load_mfp_data_from_csv(str(H_CSV_FILE))
+            c_micro_data = load_mfp_data_from_csv(str(C_CSV_FILE))
+            
+            # 计算聚乙烯的组合宏观截面
+            pe_data_calculated = calculate_pe_macro_sigma(h_micro_data, c_micro_data)
+            
+            channel_mfp_data = pe_data_calculated
+            scintillator_mfp_data = pe_data_calculated
+            print(f"[info] Calculated Polyethylene MFP data from H.csv and C.csv.")
+        else:
+            # 如果文件不存在，则退回使用占位符
+            channel_mfp_data = MFP_DATA_PE
+            scintillator_mfp_data = MFP_DATA_PE
+            print("[info] Using default internal MFP data for Polyethylene.")
+    except Exception as e:
+        print(f"[warning] Failed to calculate/load custom Polyethylene MFP data. Using default. Error: {e}")
+        channel_mfp_data = MFP_DATA_PE
+        scintillator_mfp_data = MFP_DATA_PE
+
     stl_file_path: Optional[Path] = None
     for candidate in ("Target ball model.stl", "Target_ball_model.stl"):
         path = base_dir / candidate
@@ -1061,10 +1312,10 @@ if __name__ == "__main__":
     )
 
     # Simulation parameters (adjust as needed)
-    n_neutrons = 1000
-    aluminium_mfp = 0.0694  # 6.94 cm mean free path in aluminium
+    n_neutrons = 3000
+    #aluminium_mfp = 0.0694  # 6.94 cm mean free path in aluminium
     scintillator_thickness = 0.05  # Scintillator thickness (m)
-    scintillator_mfp = 0.01  # Mean free path in the scintillator (m)
+    #scintillator_mfp = 0.01  # Mean free path in the scintillator (m)
     aluminium_mass_ratio = 26.98  # Mass ratio A for aluminium
     scintillator_mass_ratio = 1.0  # Dominant scattering nucleus (hydrogen)
     channel_mfp = 0.0602  # 6.02 cm in polyethylene
@@ -1073,17 +1324,16 @@ if __name__ == "__main__":
     tof_list = run_simulation(
         n_neutrons=n_neutrons,
         shell_thickness=shell_thickness,
-        aluminium_mfp=aluminium_mfp,
+        aluminium_mfp_data=MFP_DATA_AL,
         aluminium_mass_ratio=aluminium_mass_ratio,
         scintillator_thickness=scintillator_thickness,
-        scintillator_mfp=scintillator_mfp,
         scintillator_mass_ratio=scintillator_mass_ratio,
         detector_distance=16.0,
         detector_side=1.0,
         energy_cutoff_mev=0.1,
         shell_geometry=shell_geometry,
         channel_geometry=channel_geometry,
-        channel_mfp=channel_mfp,
+        channel_mfp_data=MFP_DATA_PE,
         channel_mass_ratio=channel_mass_ratio,
         source_cone_axis=channel_axis,
         detector_plane=detector_plane,
