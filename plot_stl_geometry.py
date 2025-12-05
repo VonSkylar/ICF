@@ -30,6 +30,10 @@ def load_mesh_mm(stl_path: Path) -> np.ndarray:
     mesh = load_stl_mesh(str(stl_path))
     if mesh.size == 0:
         raise ValueError("STL mesh is empty")
+    # Handle new format: (n, 4, 3) with normals -> extract vertices only
+    if mesh.shape[1] == 4:
+        # Format is [normal, v0, v1, v2], extract vertices
+        mesh = mesh[:, 1:, :]  # Shape becomes (n, 3, 3)
     return mesh
 
 
