@@ -24,8 +24,8 @@ The basic workflow is as follows:
    neutron's direction is randomised and its energy is updated using a 
    two-body kinematic model. Once the neutron exits the shell geometry 
    or the energy drops below 0.1 MeV, it leaves the shell or is absorbed.
-3. **Flight through the nTOF channel** - After emerging from the shell, the
-   neutron may intersect the polyethylene structures described by nTOF.STL.
+3. **Flight through the nTOF_without_scintillant channel** - After emerging from the shell, the
+   neutron may intersect the polyethylene structures described by nTOF_without_scintillant.STL.
    If it does, Monte-Carlo collisions with the polyethylene nuclei (H and C) 
    are simulated using energy-dependent mean free paths calculated from real 
    cross-section data; otherwise the neutron travels in vacuum to the detector.
@@ -230,7 +230,7 @@ class NeutronRecord:
 ################################################################################
 
 # Default source cone half-angle (degrees)
-DEFAULT_SOURCE_CONE_HALF_ANGLE_DEG = 2
+DEFAULT_SOURCE_CONE_HALF_ANGLE_DEG = 5
 
 
 ################################################################################
@@ -997,10 +997,10 @@ def scatter_energy_elastic(neutron_energy_mev: float, target_mass_ratio: float) 
     scattering off a stationary nucleus of mass ratio A (= target mass /
     neutron mass) the fractional energy retention r is
 
-        r = [ (A �?1)² + 2(A + 1) cos θ + 1 ] / (A + 1)²
+        r = [ (A - 1)² + 2(A + 1) cos θ + 1 ] / (A + 1)²
 
     where θ is a random angle uniformly distributed in [0, π].  After the
-    collision the neutron energy becomes E�?= r E.  This formula ignores
+    collision the neutron energy becomes E= r E.  This formula ignores
     details such as angular distributions that vary with energy and nuclear
     structure, but provides a reasonable first approximation.
 
@@ -1010,7 +1010,7 @@ def scatter_energy_elastic(neutron_energy_mev: float, target_mass_ratio: float) 
         Incoming neutron energy in MeV.
     target_mass_ratio : float
         Ratio of the target nucleus mass to the neutron mass (A).  For
-        aluminium, A �?26.98.  For hydrogen in a plastic scintillator, A = 1.
+        aluminium, A ≈ 26.98.  For hydrogen in a plastic scintillator, A = 1.
 
     Returns
     -------
@@ -1024,8 +1024,9 @@ def scatter_energy_elastic(neutron_energy_mev: float, target_mass_ratio: float) 
     numerator = (A - 1.0) * (A - 1.0) + 2.0 * (A + 1.0) * cos_theta + 1.0
     denominator = (A + 1.0) * (A + 1.0)
     r = numerator / denominator
-    # Energy cannot be negative; ensure r�?
-    r = max(r, 0.0)
+    # Physical constraint: elastic scattering cannot increase energy
+    # Ensure 0 ≤ r ≤ 1
+    r = max(0.0, min(r, 1.0))
     return float(neutron_energy_mev * r)
 
 
@@ -1037,7 +1038,7 @@ def load_mfp_data_from_csv(file_path: str) -> np.ndarray:
     """
     Load macro-scopic cross section data from a two-column CSV file.
 
-    The file must contain data pairs: [Energy (MeV), Sigma_Macro (m⁻�?].
+    The file must contain data pairs: [Energy (MeV), Sigma_Macro (m⁻¹)].
     The function handles conversion and ensures the data is sorted by energy.
 
     Parameters
@@ -1077,7 +1078,7 @@ def load_mfp_data_from_csv(file_path: str) -> np.ndarray:
             file_path, 
             delimiter=';', 
             skiprows=skip_rows, 
-            usecols=(0, 1), # 使用�?�?Energy)和第1�?Sigma_Macro)
+            usecols=(0, 1), # 使用第0列(Energy)和第1列(Sigma_Macro)
             dtype=float
         )
         
@@ -1090,7 +1091,7 @@ def load_mfp_data_from_csv(file_path: str) -> np.ndarray:
         raise ValueError(f"Could not load and process data from CSV: {e}")
 
     if data.ndim != 2 or data.shape[1] != 2:
-        raise ValueError("Processed data must contain exactly two columns: Energy (MeV) and Macro-Sigma (m⁻�?.")
+        raise ValueError("Processed data must contain exactly two columns: Energy (MeV) and Macro-Sigma (m⁻¹).")
 
     # Ensure data is sorted by Energy for correct interpolation
     data = data[data[:, 0].argsort()]
@@ -1103,12 +1104,12 @@ def calculate_pe_macro_sigma(
     density_g_cm3: float = 0.92,
 ) -> np.ndarray:
     """
-    Calculates the macroscopic cross section for Polyethylene (C₂H�? 
+    Calculates the macroscopic cross section for Polyethylene (C₂H₄) 
     by combining Hydrogen (H) and Carbon (C) micro-sections.
 
     Assumes H and C data arrays contain micro-sections (sigma) in BARN.
     
-    PE molar mass (C₂H�?: M_PE = 2 * M_C + 4 * M_H �?28.05 g/mol.
+    PE molar mass (C₂H₄): M_PE = 2 * M_C + 4 * M_H ≈ 28.05 g/mol.
     
     Macro-section Sigma = N_i * sigma_i(E).
 
@@ -1124,21 +1125,21 @@ def calculate_pe_macro_sigma(
     Returns
     -------
     np.ndarray, shape (N, 2)
-        Combined [Energy (MeV), Sigma_Macro_PE (m⁻�?].
+        Combined [Energy (MeV), Sigma_Macro_PE (m⁻¹)].
     """
     
     # 1. PE 物理常数
     M_C = 12.011  # g/mol
     M_H = 1.008  # g/mol
-    M_PE = 2 * M_C + 4 * M_H  # �?28.05 g/mol (C₂H�?
+    M_PE = 2 * M_C + 4 * M_H  # ≈ 28.05 g/mol (C₂H₄)
     
-    # 2. 计算原子核数密度 N_i (m⁻�?
+    # 2. 计算原子核数密度 N_i (m⁻³)
     # N_i = (rho * N_A * n_i) / M_PE
-    rho_kg_m3 = density_g_cm3 * 1000 # kg/m³ (或保�?g/cm³, 最终单位调�?
+    rho_kg_m3 = density_g_cm3 * 1000 # kg/m³ (或保留 g/cm³, 最终单位调整)
     
-    # 我们使用 M_PE (g/mol) �?rho (g/cm³) 进行计算，最终转换为 m⁻�?
-    # N_i (cm⁻�? = (rho_g_cm3 * N_A * n_i) / M_PE
-    # N_i (m⁻�? = N_i (cm⁻�? * 1e6
+    # 我们使用 M_PE (g/mol) 和 rho (g/cm³) 进行计算，最终转换为 m⁻³
+    # N_i (cm⁻³) = (rho_g_cm3 * N_A * n_i) / M_PE
+    # N_i (m⁻³) = N_i (cm⁻³) * 1e6
     
     N_C_cm3 = (density_g_cm3 * AVOGADRO_CONSTANT * 2) / M_PE
     N_H_cm3 = (density_g_cm3 * AVOGADRO_CONSTANT * 4) / M_PE
@@ -1146,16 +1147,16 @@ def calculate_pe_macro_sigma(
     N_C_m3 = N_C_cm3 * 1e6
     N_H_m3 = N_H_cm3 * 1e6
 
-    # 3. 创建统一的能量网�?
+    # 3. 创建统一的能量网格
     all_energies = np.unique(np.concatenate([h_micro_data[:, 0], c_micro_data[:, 0]]))
     
-    # 4. 插值微观截�?(Sigma_Micro) 到统一网格
+    # 4. 插值微观截面(Sigma_Micro) 到统一网格
     sigma_h_interp_barn = np.interp(all_energies, h_micro_data[:, 0], h_micro_data[:, 1])
     sigma_c_interp_barn = np.interp(all_energies, c_micro_data[:, 0], c_micro_data[:, 1])
     
-    # 5. 计算最终的宏观截面 Sigma_Macro (m⁻�?
-    # Sigma_Macro (m⁻�? = N_i (m⁻�? * sigma_i (m²)
-    # Sigma_Macro (m⁻�? = N_i (m⁻�? * sigma_i (barn) * BARN_TO_M2
+    # 5. 计算最终的宏观截面 Sigma_Macro (m⁻¹)
+    # Sigma_Macro (m⁻¹) = N_i (m⁻³) * sigma_i (m²)
+    # Sigma_Macro (m⁻¹) = N_i (m⁻³) * sigma_i (barn) * BARN_TO_M2
     
     sigma_pe_total_m1 = (
         N_C_m3 * sigma_c_interp_barn * BARN_TO_M2 +
@@ -1172,25 +1173,25 @@ def calculate_pe_macro_sigma(
 # Energy-dependent MFP utility (UPDATED FUNCTION)
 ################################################################################
 
-# 示例数据结构: 预设的宏观截面数据（能量 [MeV] -> 宏观截面 [m⁻¹]�?
-# 注意：这些数据需要根据材料密度和真实核数据计算得到�?
-# 聚乙�?(C₂H�? 密度 �?0.92 g/cm³)
+# 示例数据结构: 预设的宏观截面数据（能量 [MeV] -> 宏观截面 [m⁻¹]）
+# 注意：这些数据需要根据材料密度和真实核数据计算得到。
+# 聚乙烯(C₂H₄) 密度 ≈ 0.92 g/cm³)
 MFP_DATA_PE = np.array([
-    [0.1, 15.0],  # 0.1 MeV 时的宏观截面 (m⁻�?
+    [0.1, 15.0],  # 0.1 MeV 时的宏观截面 (m⁻¹)
     [0.5, 13.5],
     [1.0, 10.0],
-    [2.45, 16.6], # 2.45 MeV 基准�?
+    [2.45, 16.6], # 2.45 MeV 基准值
     [5.0, 17.5],
     [10.0, 18.0],
     [14.1, 17.8], # D-T 中子能量
 ])
 
-# �?(Al, 密度 �?2.70 g/cm³)
+# 铝(Al, 密度 ≈ 2.70 g/cm³)
 MFP_DATA_AL = np.array([
     [0.1, 10.0],
     [0.5, 11.2],
     [1.0, 13.0],
-    [2.45, 14.4], # 2.45 MeV 基准�?
+    [2.45, 14.4], # 2.45 MeV 基准值
     [5.0, 15.5],
     [10.0, 16.0],
     [14.1, 16.2],
@@ -1202,38 +1203,38 @@ def get_mfp_energy_dependent(
     mfp_data: np.ndarray,
 ) -> float:
     """
-    根据中子能量计算平均自由程（MFP），使用线性插值�?
+    根据中子能量计算平均自由程（MFP），使用线性插值。
 
     参数
     ----------
     energy_mev : float
-        中子的当前动�?(MeV)�?
+        中子的当前动能(MeV)。
     mfp_data : np.ndarray
-        预设�?[能量 (MeV), 宏观截面 (m⁻�?] 数据对数组�?
+        预设的 [能量 (MeV), 宏观截面 (m⁻¹)] 数据对数组。
 
     返回
     -------
     float
-        新的平均自由�?(m)�?
+        新的平均自由程(m)。
     """
     if energy_mev <= 0.1:
-        return 1e12  # 能量为零，视为停止（无限�?MFP，但实际会被截止�?
+        return 1e12  # 能量为零，视为停止（无限大 MFP，但实际会被截止）
 
     energies = mfp_data[:, 0]
     sigmas = mfp_data[:, 1]
     
-    # 确保能量在插值范围内，否则使用边界值（常数外插�?
+    # 确保能量在插值范围内，否则使用边界值（常数外插）
     if energy_mev < energies.min():
         sigma = sigmas[0]
     elif energy_mev > energies.max():
         sigma = sigmas[-1]
     else:
-        # 使用线性插值计算宏观截�?sigma (m⁻�?
+        # 使用线性插值计算宏观截面 sigma (m⁻¹)
         sigma = np.interp(energy_mev, energies, sigmas)
 
-    # MFP = 1 / Sigma。确�?Sigma 不为零�?
+    # MFP = 1 / Sigma。确保 Sigma 不为零。
     if sigma <= 1e-12:
-        return 1e12  # 如果宏观截面为零，MFP 视为无限�?
+        return 1e12  # 如果宏观截面为零，MFP 视为无限大
         
     # 返回 MFP (m)
     return 1.0 / sigma
@@ -1285,11 +1286,11 @@ def simulate_in_aluminium(
     Returns
     -------
     tuple of (time, energy, direction, position)
-        * **time** �?the total time spent from the target centre to the aluminium
+        * **time** - the total time spent from the target centre to the aluminium
           exit point (s).
-        * **energy** �?the neutron energy after leaving the shell (MeV).
-        * **direction** �?the final direction unit vector when exiting the shell.
-        * **position** �?3‑D position (m) of the exit point relative to the origin.
+        * **energy** - the neutron energy after leaving the shell (MeV).
+        * **direction** - the final direction unit vector when exiting the shell.
+        * **position** - 3-D position (m) of the exit point relative to the origin.
     """
     direction = np.array(direction, dtype=float)
     norm = np.linalg.norm(direction)
@@ -1595,7 +1596,7 @@ def simulate_neutron_history(
     aluminium_mfp_data : np.ndarray
         Mean free path data array for neutron collisions in aluminium (m).
     aluminium_mass_ratio : float
-        Aluminium nucleus mass divided by neutron mass (A�?6.98).
+        Aluminium nucleus mass divided by neutron mass (A ≈ 26.98).
     scintillator_thickness : float
         Thickness of the scintillator (m).
     scintillator_mfp_data : np.ndarray
@@ -1754,15 +1755,13 @@ def simulate_neutron_history(
         )
         return ("success", record)
 
-    # 4. Flight to the scintillator (only if not already crossed inside channel)
-    flight_time, hit_point = propagate_to_scintillator(
-        pos_after_channel,
-        d_after_channel,
-        E_after_channel,
-        detector_plane,
-        energy_cutoff_mev=energy_cutoff_mev,
-    )
-    if flight_time is None:
+    # 4. Check final position relative to detector plane
+    # If neutron exited all materials without hitting detector, determine if it missed or never reached
+    pos_proj = np.dot(detector_plane.axis, pos_after_channel - detector_plane.center)
+    
+    if pos_proj > 0:
+        # Neutron has passed beyond the detector plane without hitting it
+        # This is a confirmed miss
         record = NeutronRecord(
             initial_energy=E0,
             final_energy=E_after_channel,
@@ -1777,27 +1776,54 @@ def simulate_neutron_history(
             final_direction=d_after_channel.copy()
         )
         return ("missed_detector", record)
+    else:
+        # Neutron is still before the detector plane
+        # Try vacuum flight to detector (no more material interactions)
+        flight_time, hit_point = propagate_to_scintillator(
+            pos_after_channel,
+            d_after_channel,
+            E_after_channel,
+            detector_plane,
+            energy_cutoff_mev=energy_cutoff_mev,
+        )
+        
+        if flight_time is None:
+            # Neutron won't reach detector even in vacuum flight
+            record = NeutronRecord(
+                initial_energy=E0,
+                final_energy=E_after_channel,
+                tof=t_shell + t_channel,
+                exit_position=pos_after_shell.copy(),
+                detector_hit_position=None,
+                reached_detector=False,
+                energy_after_shell=E_after_shell,
+                energy_after_channel=E_after_channel,
+                status="missed_detector",
+                final_position=pos_after_channel.copy(),
+                final_direction=d_after_channel.copy()
+            )
+            return ("missed_detector", record)
 
-    # At this point, neutron has reached the detector surface
-    # Record the energy at detector entrance (E_after_channel) and total TOF
-    # Total TOF = time through shell + time through channel + flight time to detector
-    total_tof = t_shell + t_channel + flight_time
-    
-    record = NeutronRecord(
-        initial_energy=E0,
-        final_energy=E_after_channel,  # Energy when reaching detector
-        tof=total_tof,
-        exit_position=pos_after_shell.copy(),
-        detector_hit_position=hit_point.copy() if hit_point is not None else None,
-        reached_detector=True,
-        energy_after_shell=E_after_shell,
-        energy_after_channel=E_after_channel,
-        status="success",
-        final_position=hit_point.copy() if hit_point is not None else None,
-        final_direction=d_after_channel.copy()
-    )
-    
-    return ("success", record)
+        # At this point, neutron has reached the detector surface via vacuum flight
+        # Record the energy at detector entrance (E_after_channel) and total TOF
+        # Total TOF = time through shell + time through channel + flight time to detector
+        total_tof = t_shell + t_channel + flight_time
+        
+        record = NeutronRecord(
+            initial_energy=E0,
+            final_energy=E_after_channel,  # Energy when reaching detector
+            tof=total_tof,
+            exit_position=pos_after_shell.copy(),
+            detector_hit_position=hit_point.copy() if hit_point is not None else None,
+            reached_detector=True,
+            energy_after_shell=E_after_shell,
+            energy_after_channel=E_after_channel,
+            status="success",
+            final_position=hit_point.copy() if hit_point is not None else None,
+            final_direction=d_after_channel.copy()
+        )
+        
+        return ("success", record)
 
 
 def run_simulation(
@@ -2157,9 +2183,9 @@ def visualize_neutron_data(records: List[NeutronRecord], save_path: Optional[str
     
     plt.tight_layout()
     
-    # if save_path:
-    #     plt.savefig(f"{save_path}_comprehensive.png", dpi=300, bbox_inches='tight')
-    #     print(f"[info] Saved comprehensive visualization to {save_path}_comprehensive.png")
+    if save_path:
+        plt.savefig(f"{save_path}_comprehensive.png", dpi=300, bbox_inches='tight')
+        print(f"[info] Saved comprehensive visualization to {save_path}_comprehensive.png")
     
     plt.show()
 
@@ -2240,9 +2266,9 @@ def visualize_detector_hits(records: List[NeutronRecord], detector_plane: Detect
     
     plt.tight_layout()
     
-    # if save_path:
-    #     plt.savefig(f"{save_path}_detector_hits.png", dpi=300, bbox_inches='tight')
-    #     print(f"[info] Saved detector hit visualization to {save_path}_detector_hits.png")
+    if save_path:
+        plt.savefig(f"{save_path}_detector_hits.png", dpi=300, bbox_inches='tight')
+        print(f"[info] Saved detector hit visualization to {save_path}_detector_hits.png")
     
     plt.show()
 
@@ -2338,10 +2364,10 @@ if __name__ == "__main__":
         print(f"[warning] Failed to load custom Aluminium MFP data. Using default. Error: {e}")
         aluminium_mfp_data = MFP_DATA_AL
 
-    # --- 2. 聚乙烯数据计�?(用于 Channel) ---
+    # --- 2. 聚乙烯数据计算(用于 Channel) ---
     try:
         if H_CSV_FILE.exists() and C_CSV_FILE.exists():
-            # 加载 H �?C 的微观截面数�?
+            # 加载 H 和 C 的微观截面数据
             h_micro_data = load_mfp_data_from_csv(str(H_CSV_FILE))
             c_micro_data = load_mfp_data_from_csv(str(C_CSV_FILE))
             
@@ -2372,7 +2398,7 @@ if __name__ == "__main__":
         print(f"[info] Using STL file: {stl_file_path.name}")
 
     shell_mesh = load_stl_mesh(str(stl_file_path))
-    channel_mesh_path = base_dir / "nTOF.STL"
+    channel_mesh_path = base_dir / "nTOF_without_scintillant.STL"
     channel_mesh = load_stl_mesh(str(channel_mesh_path))
     unit_scale = 1.0e-3  # Convert millimetres to metres
     mesh_scaled = shell_mesh * unit_scale
@@ -2381,15 +2407,26 @@ if __name__ == "__main__":
     channel_geometry = prepare_mesh_geometry(channel_scaled)
     mean_radius, max_radius = mesh_distance_statistics(mesh_scaled)
     
-    # Use the exact known channel axis (in mm, need to convert and normalize)
-    # Given axis direction: [-2679.25, 0, -1109.78]
-    channel_axis_mm = np.array([-2679.25, 0.0, -1109.78])
-    channel_axis = channel_axis_mm / np.linalg.norm(channel_axis_mm)  # Normalize to unit vector
+    # =========================================================================
+    # COORDINATE SYSTEM CONFIGURATION (Updated)
+    # =========================================================================
+    # The STL files have been rotated to a new coordinate system:
+    # - Polyethylene channel (nTOF_without_scintillant) is aligned along the +Z axis
+    # - Detector (scintillator) plane is perpendicular to Z axis (in XY plane)
+    # - Neutron source is at the origin (0, 0, 0)
+    # - Neutrons travel in the +Z direction through the channel to the detector
+    # =========================================================================
     
-    # Build circular detector with exact specifications
-    # Center: [-2679.25, 0, -1109.78] mm, Radius: 105 mm
-    detector_center_mm = np.array([-2679.25, 0.0, -1109.78])
-    detector_radius_mm = 105.0  
+    # Channel axis direction: [0, 0, 1] (positive Z direction)
+    channel_axis = np.array([0.0, 0.0, 1.0])
+    
+    # Build circular detector with updated coordinates
+    # Detector is in XY plane at z = detector_z_mm
+    # Centered at (0, 0, z) in the new coordinate system
+    # Distance calculated from original geometry: sqrt(2679.25^2 + 1109.78^2) ≈ 2900 mm
+    detector_z_mm = 2900.0  # Distance along channel axis (mm)
+    detector_center_mm = np.array([0.0, 0.0, detector_z_mm])
+    detector_radius_mm = 105.0  # Detector radius (mm)
     detector_plane = build_circular_detector_plane(detector_center_mm, detector_radius_mm, channel_axis)
 
     # Shell thickness is now calculated from actual STL mesh geometry
@@ -2401,12 +2438,17 @@ if __name__ == "__main__":
         f"[info] STL vertex distances: mean={mean_radius:.4f} m, "
         f"max={max_radius:.4f} m"
     )
-    print(f"[info] Using exact channel axis: {channel_axis}")
-    print(f"[info] Channel axis direction: [-2679.25, 0, -1109.78] mm")
-    print(f"[info] Circular detector - Center: {detector_center_mm} mm, Radius: {detector_radius_mm} mm")
-    print(f"[info] Detector center (meters): {detector_plane.center}")
-    print(f"[info] Detector radius: {detector_plane.radius:.4f} m")
-    print(f"[info] Detector plane position: {detector_plane.plane_position:.4f} m")
+    print("\n" + "="*70)
+    print("COORDINATE SYSTEM CONFIGURATION")
+    print("="*70)
+    print(f"Channel axis: +Z direction [0, 0, 1]")
+    print(f"Detector plane: XY plane (perpendicular to Z axis)")
+    print(f"Neutron source: Origin (0, 0, 0)")
+    print(f"Detector position: z = {detector_z_mm:.1f} mm = {detector_plane.plane_position:.4f} m")
+    print(f"Detector center (3D): {detector_plane.center} m")
+    print(f"Detector radius: {detector_radius_mm:.1f} mm = {detector_plane.radius:.4f} m")
+    print(f"Source cone half-angle: {DEFAULT_SOURCE_CONE_HALF_ANGLE_DEG}°")
+    print("="*70 + "\n")
 
     # Simulation parameters (adjust as needed)
     n_neutrons = 100  # Number of neutron histories to simulate
@@ -2440,7 +2482,7 @@ if __name__ == "__main__":
     # Create visualizations
     if neutron_records:
         print("[info] Generating visualizations...")
-        save_base = str(base_dir / "neutron_analysis")
-        visualize_neutron_data(neutron_records, save_path=save_base)
-        visualize_detector_hits(neutron_records, detector_plane, save_path=save_base)
+        save_base = str(base_dir / "Figures" / "neutron_analysis")
+        visualize_neutron_data(neutron_records, save_path= save_base)
+        visualize_detector_hits(neutron_records, detector_plane, save_path= save_base)
         print("[info] Visualization complete!")

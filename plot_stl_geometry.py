@@ -88,7 +88,13 @@ def parse_args() -> argparse.Namespace:
         "--stl",
         type=Path,
         default=Path("Target_ball_model.stl"),
-        help="Path to the STL file to visualise.",
+        help="Path to the primary STL file to visualise.",
+    )
+    parser.add_argument(
+        "--nTOF_without_scintillant",
+        type=Path,
+        default=None,
+        help="Path to the nTOF_without_scintillant STL file to overlay (optional).",
     )
     return parser.parse_args()
 
@@ -111,19 +117,20 @@ def main() -> None:
     ]
     info_lines = [primary_info]
 
-    ntof_path = args.stl.with_name("nTOF.STL")
-    if ntof_path.exists():
-        ntof_mesh_mm = load_mesh_mm(ntof_path)
-        ntof_mean, ntof_max = mesh_distance_stats_mm(ntof_mesh_mm)
-        ntof_info = (
-            f"{ntof_path.name} | mean radius={ntof_mean:.2f} mm, "
-            f"max radius={ntof_max:.2f} mm"
+    # 尝试自动查找 nTOF_without_scintillant.STL，但优先使用命令行参数
+    nTOF_without_scintillant_path = args.nTOF_without_scintillant if args.nTOF_without_scintillant else args.stl.with_name("nTOF_without_scintillant.STL")
+    if nTOF_without_scintillant_path and nTOF_without_scintillant_path.exists():
+        nTOF_without_scintillant_mesh_mm = load_mesh_mm(nTOF_without_scintillant_path)
+        nTOF_without_scintillant_mean, nTOF_without_scintillant_max = mesh_distance_stats_mm(nTOF_without_scintillant_mesh_mm)
+        nTOF_without_scintillant_info = (
+            f"{nTOF_without_scintillant_path.name} | mean radius={nTOF_without_scintillant_mean:.2f} mm, "
+            f"max radius={nTOF_without_scintillant_max:.2f} mm"
         )
-        print(ntof_info)
-        info_lines.append(ntof_info)
-        meshes_to_plot.append((ntof_mesh_mm, ntof_path.name, (0.9, 0.35, 0.2, 0.28)))
+        print(nTOF_without_scintillant_info)
+        info_lines.append(nTOF_without_scintillant_info)
+        meshes_to_plot.append((nTOF_without_scintillant_mesh_mm, nTOF_without_scintillant_path.name, (0.9, 0.35, 0.2, 0.28)))
     else:
-        print(f"nTOF STL not found at {ntof_path}, skipping overlay.")
+        print(f"nTOF_without_scintillant STL not found at {nTOF_without_scintillant_path}, skipping overlay.")
 
     plot_meshes_mm(meshes_to_plot, "\n".join(info_lines))
 
