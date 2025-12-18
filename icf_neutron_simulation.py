@@ -223,6 +223,7 @@ class NeutronRecord:
     status: str = "unknown"  # Status: success, lost_in_shell, lost_in_channel, missed_detector
     final_position: Optional[np.ndarray] = None  # Final position (m)
     final_direction: Optional[np.ndarray] = None  # Final direction
+    trajectory_points: Optional[List[Tuple[np.ndarray, float]]] = None  # List of (position, energy) at each collision
 
 
 ################################################################################
@@ -230,7 +231,7 @@ class NeutronRecord:
 ################################################################################
 
 # Default source cone half-angle (degrees)
-DEFAULT_SOURCE_CONE_HALF_ANGLE_DEG = 5
+DEFAULT_SOURCE_CONE_HALF_ANGLE_DEG = 30
 
 
 ################################################################################
@@ -476,15 +477,23 @@ def transport_through_slab(
     initial_direction: Optional[np.ndarray] = None,
     start_position: Optional[np.ndarray] = None,
     detector_plane: Optional[DetectorPlane] = None,
-) -> Tuple[float, float, np.ndarray, Optional[Tuple[float, np.ndarray, float]]]:
+    collect_trajectory: bool = False,
+) -> Tuple[float, float, np.ndarray, Optional[Tuple[float, np.ndarray, float]], List[Tuple[np.ndarray, float]]]:
     """Propagate a neutron through a homogeneous slab with multiple scatterings.
     
     Now tracks position and checks for detector crossing after each free flight.
+    Also collects trajectory points if collect_trajectory=True.
+    
+    Returns
+    -------
+    tuple : (cumulative_time, energy, current_dir, detector_crossing, trajectory_points)
+        trajectory_points is a list of (position, energy) tuples at each collision
     """
     remaining = slab_thickness
     energy = float(energy_mev)
     cumulative_time = 0.0
     detector_crossing = None
+    trajectory_points = []  # List of (position, energy) at each collision
 
     # 初始化方向和速度
     if initial_direction is not None:
@@ -503,6 +512,10 @@ def transport_through_slab(
     track_position = (start_position is not None and detector_plane is not None)
     if track_position:
         current_pos = start_position.copy()
+        # Record starting position if collecting trajectory
+        if collect_trajectory:
+            trajectory_points.append((current_pos.copy(), energy))
+        
         axis = detector_plane.axis
         center = detector_plane.center
         radius = detector_plane.radius
@@ -512,9 +525,17 @@ def transport_through_slab(
         if DEBUG:
             print(f"[debug TRACK] Position tracking enabled, start={current_pos}, pos_value_init={pos_value_init:.4f}")
     else:
+        current_pos = start_position.copy() if start_position is not None else np.zeros(3)
+        # Record starting position if collecting trajectory
+        if collect_trajectory:
+            trajectory_points.append((current_pos.copy(), energy))
+        
         if DEBUG:
             print(f"[debug NO TRACK] Position tracking disabled: start_position={start_position is not None}, detector_plane={detector_plane is not None}")
-        radius = detector_plane.radius
+        if detector_plane is not None:
+            radius = detector_plane.radius
+            axis = detector_plane.axis
+            center = detector_plane.center
 
     # --- 在循环开始前计算当前的MFP ---
     mean_free_path = get_mfp_energy_dependent(energy,mfp_data)
@@ -549,7 +570,7 @@ def transport_through_slab(
                             time_to_crossing = dist_to_crossing / speed
                             detector_crossing = (time_to_crossing, crossing_point, energy)
         
-        return cumulative_time, energy, current_dir, detector_crossing
+        return cumulative_time, energy, current_dir, detector_crossing, trajectory_points
 
 
     while energy > energy_cutoff_mev and remaining > 0.0:
@@ -591,6 +612,8 @@ def transport_through_slab(
         # Update position
         if track_position:
             current_pos += step * current_dir
+        else:
+            current_pos += step * current_dir
         
         cumulative_time += step / speed
         remaining -= step
@@ -615,8 +638,12 @@ def transport_through_slab(
             current_dir = sample_isotropic_direction()
             speed = energy_to_speed(energy)
             mean_free_path = get_mfp_energy_dependent(energy, mfp_data)
+            
+            # Record collision position and energy
+            if collect_trajectory:
+                trajectory_points.append((current_pos.copy(), energy))
     
-    return cumulative_time, energy, current_dir, detector_crossing
+    return cumulative_time, energy, current_dir, detector_crossing, trajectory_points
 
 
 def propagate_through_mesh_material(
@@ -629,7 +656,7 @@ def propagate_through_mesh_material(
     energy_cutoff_mev: float,
     max_segments: int = 20,
     detector_plane: Optional[DetectorPlane] = None,
-) -> Tuple[float, float, np.ndarray, np.ndarray, Optional[Tuple[float, np.ndarray]]]:
+) -> Tuple[float, float, np.ndarray, np.ndarray, Optional[Tuple[float, np.ndarray]], List[Tuple[np.ndarray, float]]]:
     """Advance a neutron through a mesh-defined solid material.
     
     This function properly handles segmented/discontinuous geometries by
@@ -647,11 +674,14 @@ def propagate_through_mesh_material(
     Returns
     -------
     tuple
-        (cumulative_time, current_energy, current_pos, dir_norm, detector_crossing)
+        (cumulative_time, current_energy, current_pos, dir_norm, detector_crossing, trajectory_points)
         detector_crossing is None if no crossing, or (time_to_detector, hit_point) if crossed.
+        trajectory_points is a list of (position, energy) tuples at each collision.
     """
+    trajectory_points = []  # Collect trajectory points from all segments
+    
     if geometry is None:
-        return 0.0, energy_mev, np.array(position, dtype=float), np.array(direction, dtype=float), None
+        return 0.0, energy_mev, np.array(position, dtype=float), np.array(direction, dtype=float), None, trajectory_points
 
     current_pos = np.array(position, dtype=float)
     dir_norm = np.array(direction, dtype=float)
@@ -690,7 +720,7 @@ def propagate_through_mesh_material(
         if exit_hit is None:
             # No exit found - neutron is lost inside material
             cumulative_time += vacuum_time
-            return cumulative_time, energy_cutoff_mev, inside_origin, dir_norm, detector_crossing
+            return cumulative_time, energy_cutoff_mev, inside_origin, dir_norm, detector_crossing, trajectory_points
         
         # Calculate path length through THIS segment only
         path_inside = exit_hit[0]
@@ -699,7 +729,7 @@ def propagate_through_mesh_material(
         energy_before_segment = current_energy
         
         # Simulate collisions within this segment
-        slab_time, energy_after, direction_after, material_detector_crossing = transport_through_slab(
+        slab_time, energy_after, direction_after, material_detector_crossing, segment_trajectory = transport_through_slab(
             current_energy,
             path_inside,
             mfp_data,
@@ -708,9 +738,12 @@ def propagate_through_mesh_material(
             initial_direction=dir_norm,
             start_position=entry_point,
             detector_plane=detector_plane,
+            collect_trajectory=True,  # 收集完整轨迹
         )
         cumulative_time += vacuum_time + slab_time
         current_energy = energy_after
+        # Collect trajectory points from this segment
+        trajectory_points.extend(segment_trajectory)
         
         # If detector was hit inside material, record it
         if material_detector_crossing is not None and detector_crossing is None:
@@ -725,7 +758,7 @@ def propagate_through_mesh_material(
         if current_energy <= energy_cutoff_mev:
             # Exit point is along the original trajectory (before final scatter)
             exit_point = inside_origin + dir_norm * path_inside
-            return cumulative_time, current_energy, exit_point, direction_after, detector_crossing
+            return cumulative_time, current_energy, exit_point, direction_after, detector_crossing, trajectory_points
         
         # Move to exit point of this segment, ready for next iteration
         # The exit point is along the ORIGINAL direction (geometric path through mesh)
@@ -855,7 +888,7 @@ def propagate_through_mesh_material(
         # We don't want to continue into the scintillator volume
         if detector_crossing is not None:
             # Return current state at detector crossing
-            return cumulative_time, current_energy, current_pos, dir_norm, detector_crossing
+            return cumulative_time, current_energy, current_pos, dir_norm, detector_crossing, trajectory_points
         
         # Also check if we've passed the detector plane without crossing it
         # This means the neutron missed the detector aperture or is traveling through continuous material
@@ -877,7 +910,7 @@ def propagate_through_mesh_material(
                     print(f"[debug] Passed detector: proj={current_proj:.4f}m, perp={perp_dist*1000:.1f}mm")
                 
                 # Stop propagation - we've passed the detector region
-                return cumulative_time, current_energy, current_pos, dir_norm, detector_crossing
+                return cumulative_time, current_energy, current_pos, dir_norm, detector_crossing, trajectory_points
         
         # Update direction for next segment (after scattering)
         dir_norm = direction_after / np.linalg.norm(direction_after)
@@ -891,7 +924,7 @@ def propagate_through_mesh_material(
             print(f"[debug seg {segment_idx}] pos_proj={proj:.4f}m, E={current_energy:.4f}")
     
     # Exited all material segments successfully
-    return cumulative_time, current_energy, current_pos, dir_norm, detector_crossing
+    return cumulative_time, current_energy, current_pos, dir_norm, detector_crossing, trajectory_points
 
 
 ################################################################################
@@ -1252,7 +1285,7 @@ def simulate_in_aluminium(
     energy_cutoff_mev: float = 0.1,
     mesh_geometry: Optional[MeshGeometry] = None,
     detector_plane: Optional[DetectorPlane] = None,
-) -> Tuple[float, float, np.ndarray, np.ndarray, Optional[Tuple[float, np.ndarray, float]]]:
+) -> Tuple[float, float, np.ndarray, np.ndarray, Optional[Tuple[float, np.ndarray, float]], List[Tuple[np.ndarray, float]]]:
     """Simulate neutron transport and scattering in an aluminium shell.
 
     When ``mesh_geometry`` is provided the neutron first propagates in vacuum
@@ -1264,6 +1297,12 @@ def simulate_in_aluminium(
     free-path distribution.  This treatment captures the presence of holes in
     the shell: directions that miss the mesh experience no aluminium
     interactions.
+    
+    Returns
+    -------
+    tuple
+        (time, energy, direction, position, detector_crossing, trajectory_points)
+        trajectory_points is a list of (position, energy) tuples at each collision
 
     Parameters
     ----------
@@ -1302,13 +1341,14 @@ def simulate_in_aluminium(
     speed = energy_to_speed(energy)
     cumulative_time = 0.0
     detector_crossing = None
+    trajectory_points = []  # Collect trajectory points in shell
 
     # If a mesh is supplied, determine whether the neutron encounters aluminium.
     origin = np.zeros(3, dtype=float)
 
     if mesh_geometry is None:
         # Simple slab approximation when no geometry is supplied.
-        slab_time, energy, current_dir, material_crossing = transport_through_slab(
+        slab_time, energy, current_dir, material_crossing, slab_trajectory = transport_through_slab(
             energy,
             shell_thickness,
             aluminium_mfp_data, # 传入数据数组
@@ -1317,32 +1357,39 @@ def simulate_in_aluminium(
             initial_direction=direction,
             start_position=origin,
             detector_plane=detector_plane,
+            collect_trajectory=True,  # 收集完整轨迹
         )
         cumulative_time += slab_time
         position = origin + direction * shell_thickness
         if material_crossing is not None:
             detector_crossing = (material_crossing[0], material_crossing[1], material_crossing[2])
-        return cumulative_time, energy, current_dir, position, detector_crossing
+        # Collect trajectory points from slab
+        trajectory_points.extend(slab_trajectory)
+        return cumulative_time, energy, current_dir, position, detector_crossing, trajectory_points
 
     # Detailed treatment using STL geometry
     # Find first intersection (entry point into aluminum shell)
     hit_entry = ray_mesh_intersection(origin, direction, mesh_geometry)
     if hit_entry is None:
         # Trajectory leaves through an opening without touching aluminium.
+        # The neutron flies through a hole in the shell.
+        # We need to advance the neutron to approximately where the shell would be.
+        # Use shell_thickness as an estimate of the radial distance to the outer surface
+        typical_shell_radius = 1.2  # meters, from STL analysis (mean vertex distance)
+        exit_position = origin + direction * typical_shell_radius
+        vacuum_time = typical_shell_radius / speed
+        cumulative_time += vacuum_time
+        
         # Still need to check if detector was crossed during this vacuum flight!
         if detector_plane is not None and detector_plane.is_circular:
-            # Check vacuum flight from origin to infinity (or until detector)
-            max_flight_dist = 20.0  # 20 meters max
-            far_point = origin + direction * max_flight_dist
-            
             center = detector_plane.center
             axis = detector_plane.axis
             pos_value = np.dot(axis, origin - center)
-            far_value = np.dot(axis, far_point - center)
+            exit_value = np.dot(axis, exit_position - center)
             
             # Check if crosses detector plane
-            if pos_value * far_value < 0:
-                path_vec = far_point - origin
+            if pos_value * exit_value < 0:
+                path_vec = exit_position - origin
                 denominator = np.dot(axis, path_vec)
                 if abs(denominator) > 1e-10:
                     s = -pos_value / denominator
@@ -1356,7 +1403,7 @@ def simulate_in_aluminium(
                             dist_to_crossing = np.linalg.norm(crossing_point - origin)
                             time_to_crossing = dist_to_crossing / speed
                             detector_crossing = (time_to_crossing, crossing_point, energy)
-        return cumulative_time, energy, direction, origin.copy(), detector_crossing
+        return cumulative_time, energy, direction, exit_position, detector_crossing, trajectory_points
 
     distance_to_entry, entry_point, entry_normal = hit_entry
     
@@ -1400,7 +1447,7 @@ def simulate_in_aluminium(
         # This shouldn't happen for a closed mesh
         # The neutron has entered but cannot find an exit - likely a mesh issue
         # Treat as absorbed/lost in the shell
-        return cumulative_time, energy_cutoff_mev - 0.01, direction, position, detector_crossing
+        return cumulative_time, energy_cutoff_mev - 0.01, direction, position, detector_crossing, trajectory_points
     
     distance_to_exit, mesh_exit_point, exit_normal = hit_exit
     # Calculate actual path length through the mesh
@@ -1412,7 +1459,7 @@ def simulate_in_aluminium(
     
     # Slab simulation inside the mesh material
     # We call transport_through_slab to simulate the interaction in the slab material
-    slab_time, energy_out, direction_out, material_crossing = transport_through_slab(
+    slab_time, energy_out, direction_out, material_crossing, slab_trajectory = transport_through_slab(
         energy,  # Use current energy, not initial energy_mev
         path_length_along_direction, # Actual path length through the mesh
         aluminium_mfp_data, # 传入数据数组
@@ -1421,6 +1468,7 @@ def simulate_in_aluminium(
         initial_direction=direction,
         start_position=position,
         detector_plane=detector_plane,
+        collect_trajectory=True,  # 收集完整轨迹
     )
     
     # Check if detector was crossed inside aluminum
@@ -1433,7 +1481,10 @@ def simulate_in_aluminium(
     # Update time and return the actual exit point
     cumulative_time += slab_time
     
-    return cumulative_time, energy_out, direction_out, actual_exit_point, detector_crossing
+    # Collect trajectory points from slab
+    trajectory_points.extend(slab_trajectory)
+    
+    return cumulative_time, energy_out, direction_out, actual_exit_point, detector_crossing, trajectory_points
 
 
 ################################################################################
@@ -1643,10 +1694,15 @@ def simulate_neutron_history(
     else:
         d0 = sample_direction_in_cone(source_cone_axis, source_cone_half_angle_deg)
 
+    # Initialize trajectory points list: (position, energy, event_type)
+    trajectory_points = []
+    # Add starting point at origin
+    trajectory_points.append((np.zeros(3), E0, "source"))
+
     # 2. Transport through the aluminium shell
     detector_plane = detector_plane or build_default_detector_plane(detector_distance, detector_side)
 
-    t_shell, E_after_shell, d_after_shell, pos_after_shell, shell_detector_crossing = simulate_in_aluminium(
+    t_shell, E_after_shell, d_after_shell, pos_after_shell, shell_detector_crossing, shell_trajectory = simulate_in_aluminium(
         d0,
         E0,
         shell_thickness,
@@ -1656,9 +1712,16 @@ def simulate_neutron_history(
         mesh_geometry=shell_geometry,
         detector_plane=detector_plane,
     )
+    # Merge shell trajectory points into main trajectory with event type
+    for pos, energy in shell_trajectory:
+        trajectory_points.append((pos, energy, "scatter"))
     # Check if detector was hit during shell transport
     if shell_detector_crossing is not None:
         crossing_time, crossing_point, crossing_energy = shell_detector_crossing
+        # Add shell exit and detector hit to trajectory
+        trajectory_points.append((pos_after_shell.copy(), E_after_shell, "shell_exit"))
+        trajectory_points.append((crossing_point.copy(), crossing_energy, "detector_hit"))
+        
         record = NeutronRecord(
             initial_energy=E0,
             final_energy=crossing_energy,
@@ -1670,11 +1733,15 @@ def simulate_neutron_history(
             energy_after_channel=crossing_energy,
             status="success",
             final_position=crossing_point.copy(),
-            final_direction=d_after_shell.copy()
+            final_direction=d_after_shell.copy(),
+            trajectory_points=trajectory_points
         )
         if DEBUG:
             print(f"[debug] Neutron hit detector during shell phase at t={crossing_time*1e9:.1f}ns")
         return ("success", record)
+    
+    # Add shell exit point to trajectory
+    trajectory_points.append((pos_after_shell.copy(), E_after_shell, "shell_exit"))
     
     # If energy is below cutoff the neutron was absorbed in the shell
     if E_after_shell <= energy_cutoff_mev:
@@ -1689,7 +1756,8 @@ def simulate_neutron_history(
             energy_after_channel=0.0,
             status="lost_in_shell",
             final_position=pos_after_shell.copy(),
-            final_direction=d_after_shell.copy()
+            final_direction=d_after_shell.copy(),
+            trajectory_points=trajectory_points
         )
         return ("lost_in_shell", record)
 
@@ -1706,8 +1774,11 @@ def simulate_neutron_history(
         detector_plane=detector_plane,  # Pass detector plane for crossing detection
     )
     
-    # Unpack result with detector crossing info
-    t_channel, E_after_channel, pos_after_channel, d_after_channel, detector_crossing = result
+    # Unpack result with detector crossing info and trajectory points
+    t_channel, E_after_channel, pos_after_channel, d_after_channel, detector_crossing, channel_trajectory = result
+    # Merge channel trajectory points into main trajectory with event type
+    for pos, energy in channel_trajectory:
+        trajectory_points.append((pos, energy, "scatter"))
     
     # Debug output
     if DEBUG and detector_crossing is None:
@@ -1718,6 +1789,9 @@ def simulate_neutron_history(
         perpendicular_vec = to_point - parallel_component
         perp_dist = np.linalg.norm(perpendicular_vec)
         print(f"[debug] Lost: E={E_after_channel:.4f}, pos_proj={pos_proj:.4f}m, perp_dist={perp_dist*1000:.1f}mm")
+    
+    # Add channel exit point to trajectory
+    trajectory_points.append((pos_after_channel.copy(), E_after_channel, "channel_exit"))
     
     if E_after_channel <= energy_cutoff_mev:
         record = NeutronRecord(
@@ -1731,7 +1805,8 @@ def simulate_neutron_history(
             energy_after_channel=E_after_channel,
             status="lost_in_channel",
             final_position=pos_after_channel.copy(),
-            final_direction=d_after_channel.copy()
+            final_direction=d_after_channel.copy(),
+            trajectory_points=trajectory_points
         )
         return ("lost_in_channel", record)
     
@@ -1739,6 +1814,9 @@ def simulate_neutron_history(
     if detector_crossing is not None:
         crossing_time, crossing_point, crossing_energy = detector_crossing
         total_tof = t_shell + crossing_time
+        
+        # Add detector hit to trajectory
+        trajectory_points.append((crossing_point.copy(), crossing_energy, "detector_hit"))
         
         record = NeutronRecord(
             initial_energy=E0,
@@ -1751,7 +1829,8 @@ def simulate_neutron_history(
             energy_after_channel=crossing_energy,  # Use crossing energy, not end-of-channel energy
             status="success",
             final_position=crossing_point.copy(),
-            final_direction=d_after_channel.copy()
+            final_direction=d_after_channel.copy(),
+            trajectory_points=trajectory_points
         )
         return ("success", record)
 
@@ -1762,6 +1841,11 @@ def simulate_neutron_history(
     if pos_proj > 0:
         # Neutron has passed beyond the detector plane without hitting it
         # This is a confirmed miss
+        # Add an extension point to show continued trajectory (1m beyond current position)
+        extension_distance = 1.0  # meters
+        extended_point = pos_after_channel + d_after_channel * extension_distance
+        trajectory_points.append((extended_point.copy(), E_after_channel, "miss_extended"))
+        
         record = NeutronRecord(
             initial_energy=E0,
             final_energy=E_after_channel,
@@ -1773,7 +1857,8 @@ def simulate_neutron_history(
             energy_after_channel=E_after_channel,
             status="missed_detector",
             final_position=pos_after_channel.copy(),
-            final_direction=d_after_channel.copy()
+            final_direction=d_after_channel.copy(),
+            trajectory_points=trajectory_points
         )
         return ("missed_detector", record)
     else:
@@ -1789,6 +1874,11 @@ def simulate_neutron_history(
         
         if flight_time is None:
             # Neutron won't reach detector even in vacuum flight
+            # Add an extension point to show continued trajectory
+            extension_distance = 1.5  # meters - extend to show it's flying away
+            extended_point = pos_after_channel + d_after_channel * extension_distance
+            trajectory_points.append((extended_point.copy(), E_after_channel, "miss_extended"))
+            
             record = NeutronRecord(
                 initial_energy=E0,
                 final_energy=E_after_channel,
@@ -1800,7 +1890,8 @@ def simulate_neutron_history(
                 energy_after_channel=E_after_channel,
                 status="missed_detector",
                 final_position=pos_after_channel.copy(),
-                final_direction=d_after_channel.copy()
+                final_direction=d_after_channel.copy(),
+                trajectory_points=trajectory_points
             )
             return ("missed_detector", record)
 
@@ -1808,6 +1899,10 @@ def simulate_neutron_history(
         # Record the energy at detector entrance (E_after_channel) and total TOF
         # Total TOF = time through shell + time through channel + flight time to detector
         total_tof = t_shell + t_channel + flight_time
+        
+        # Add detector hit to trajectory
+        if hit_point is not None:
+            trajectory_points.append((hit_point.copy(), E_after_channel, "detector_hit"))
         
         record = NeutronRecord(
             initial_energy=E0,
@@ -1820,7 +1915,8 @@ def simulate_neutron_history(
             energy_after_channel=E_after_channel,
             status="success",
             final_position=hit_point.copy() if hit_point is not None else None,
-            final_direction=d_after_channel.copy()
+            final_direction=d_after_channel.copy(),
+            trajectory_points=trajectory_points
         )
         
         return ("success", record)
@@ -2052,6 +2148,74 @@ def export_neutron_records_to_csv(records: List[NeutronRecord], filename: str = 
     print(f"[info] Neutron data exported to {filename}")
     print(f"[info] Total records: {len(records)}")
     print(f"[info] Records that reached detector: {sum(1 for r in records if r.reached_detector)}")
+
+
+def export_neutron_trajectories_to_csv(records: List[NeutronRecord], filename: str = "neutron_trajectories.csv"):
+    """Export neutron trajectory data to a CSV file.
+    
+    This exports the complete trajectory of each neutron including all collision points.
+    
+    Parameters
+    ----------
+    records : List[NeutronRecord]
+        List of neutron records from simulation.
+    filename : str
+        Output CSV filename.
+    """
+    import csv
+    
+    if not records:
+        print("[warning] No neutron records to export.")
+        return
+    
+    # Create output directory if it doesn't exist
+    from pathlib import Path
+    output_path = Path(filename)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    # Define CSV headers
+    headers = [
+        'neutron_id',
+        'step_id',
+        'event_type',
+        'position_x_m',
+        'position_y_m',
+        'position_z_m',
+        'energy_MeV'
+    ]
+    
+    # Open file and write data
+    with open(filename, 'w', newline='', encoding='utf-8') as csvfile:
+        writer = csv.writer(csvfile)
+        writer.writerow(headers)
+        
+        for neutron_id, record in enumerate(records, start=1):
+            if record.trajectory_points is None or len(record.trajectory_points) == 0:
+                # If no trajectory data, write at least the start and end points
+                writer.writerow([neutron_id, 0, "source", 0.0, 0.0, 0.0, record.initial_energy])
+                if record.final_position is not None:
+                    writer.writerow([
+                        neutron_id, 1, "final", 
+                        record.final_position[0], record.final_position[1], record.final_position[2],
+                        record.final_energy
+                    ])
+            else:
+                # Write all trajectory points
+                for step_id, (position, energy, event_type) in enumerate(record.trajectory_points):
+                    writer.writerow([
+                        neutron_id,
+                        step_id,
+                        event_type,
+                        position[0],
+                        position[1],
+                        position[2],
+                        energy
+                    ])
+    
+    print(f"[info] Neutron trajectories exported to {filename}")
+    print(f"[info] Total neutrons: {len(records)}")
+    total_points = sum(len(r.trajectory_points) if r.trajectory_points else 0 for r in records)
+    print(f"[info] Total trajectory points: {total_points}")
 
 
 ################################################################################
@@ -2478,6 +2642,10 @@ if __name__ == "__main__":
     if neutron_records:
         csv_filename = str(base_dir / "Data" / "neutron_data.csv")
         export_neutron_records_to_csv(neutron_records, filename=csv_filename)
+        
+        # Export trajectory data
+        trajectory_filename = str(base_dir / "Data" / "neutron_trajectories.csv")
+        export_neutron_trajectories_to_csv(neutron_records, filename=trajectory_filename)
     
     # Create visualizations
     if neutron_records:
