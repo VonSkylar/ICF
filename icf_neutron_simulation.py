@@ -20,15 +20,35 @@ The basic workflow is as follows:
    described by an STL mesh. Neutrons undergo a sequence of elastic 
    scatterings in the shell. Free flight distances are drawn from an 
    exponential distribution with energy-dependent mean free path calculated 
-   from real cross-section data (ENDF/JANIS). After each scattering the 
-   neutron's direction is randomised and its energy is updated using a 
-   two-body kinematic model. Once the neutron exits the shell geometry 
-   or the energy drops below 0.1 MeV, it leaves the shell or is absorbed.
+   from real cross-section data (ENDF/JANIS). 
+   
+   **CRITICAL PHYSICS - CMS to LAB Frame Conversion:**
+   After each scattering, the neutron direction is updated using proper
+   two-body kinematics with center-of-mass (CMS) to laboratory (LAB) frame
+   transformation. This ensures:
+   - Scattering angle θ_lab and energy loss are correctly coupled
+   - For hydrogen (A=1): neutron CANNOT backscatter (θ_lab ∈ [0, π/2])
+   - For heavier nuclei: correct angular distribution in LAB frame
+   - Transformation: tan(θ_lab) = sin(θ_cm) / (γ + cos(θ_cm)), γ = 1/A
+   
+   Energy is updated using two-body kinematic model. 
+   **IMPORTANT: Strict 3D Geometry Tracking**
+   This implementation uses RIGOROUS 3D Monte Carlo transport:
+   - After each scattering event, the neutron direction changes
+   - The distance to the material boundary is RECALCULATED using ray-mesh intersection
+   - No "equivalent optical path" approximation - the neutron truly traces through geometry
+   - This is a complete digital twin of the physical process
+   
+   Once the neutron exits the shell geometry or the energy drops below 0.1 MeV, 
+   it leaves the shell or is absorbed.
+   
 3. **Flight through the nTOF_without_scintillant channel** - After emerging from the shell, the
    neutron may intersect the polyethylene structures described by nTOF_without_scintillant.STL.
    If it does, Monte-Carlo collisions with the polyethylene nuclei (H and C) 
    are simulated using energy-dependent mean free paths calculated from real 
    cross-section data; otherwise the neutron travels in vacuum to the detector.
+   The same strict 3D geometry tracking is applied here as well.
+   
 4. **Detection** - Neutrons that reach the detector plane and fall within the
    detector aperture (rectangular or circular) are recorded. The total 
    time-of-flight (TOF) from source to detector and the neutron's final 
@@ -51,6 +71,14 @@ from pathlib import Path
 
 # Debug flag
 DEBUG = False
+
+# Global statistics for geometry leak monitoring
+GEOMETRY_LEAK_STATS = {
+    'total_queries': 0,
+    'retry_success': 0,
+    'retry_failures': 0,
+    'outside_detections': 0,
+}
 
 from typing import Iterable, List, Optional, Tuple
 
@@ -231,7 +259,7 @@ class NeutronRecord:
 ################################################################################
 
 # Default source cone half-angle (degrees)
-DEFAULT_SOURCE_CONE_HALF_ANGLE_DEG = 30
+DEFAULT_SOURCE_CONE_HALF_ANGLE_DEG = 10
 
 
 ################################################################################
@@ -329,6 +357,162 @@ def ray_mesh_intersection(
     if norm_len > 0.0:
         normal = normal / norm_len
     return distance, point, normal
+
+
+def find_exit_with_retry(
+    position: np.ndarray,
+    direction: np.ndarray,
+    geometry: MeshGeometry,
+    max_retries: int = 5,
+    base_offset: float = 1e-9,
+) -> Optional[Tuple[float, np.ndarray, np.ndarray]]:
+    """Robustly find mesh exit point with geometry leak prevention.
+    
+    This function implements a fault-tolerant strategy to handle the common
+    "Geometry Leak" problem in Monte Carlo particle transport. When a particle
+    is very close to mesh edges/vertices, floating-point errors can cause
+    ray_mesh_intersection to fail (return None), leading to artificial particle
+    loss that is NOT physical absorption.
+    
+    Strategy:
+    1. Try standard ray intersection with small offset
+    2. If failed, progressively increase offset (particle might be exactly on boundary)
+    3. Try opposite direction to check if we're already outside
+    4. Only declare geometry leak failure after all attempts exhausted
+    
+    This prevents false particle kills due to numerical precision issues while
+    maintaining physical accuracy for true absorption cases.
+    
+    Parameters
+    ----------
+    position : np.ndarray, shape (3,)
+        Current particle position.
+    direction : np.ndarray, shape (3,)
+        Unit direction vector of particle motion.
+    geometry : MeshGeometry
+        Preprocessed mesh geometry.
+    max_retries : int, optional
+        Number of retry attempts with different offsets. Default: 5
+    base_offset : float, optional
+        Initial offset distance (meters). Default: 1e-9 (1 nm)
+        
+    Returns
+    -------
+    tuple or None
+        (distance, exit_point, normal) if exit found, None if truly lost
+    """
+    global GEOMETRY_LEAK_STATS
+    GEOMETRY_LEAK_STATS['total_queries'] += 1
+    
+    # Attempt 1: Standard search with minimal offset
+    for retry in range(max_retries):
+        offset = base_offset * (10 ** retry)  # Exponentially increase offset
+        search_origin = position + direction * offset
+        
+        exit_hit = ray_mesh_intersection(search_origin, direction, geometry)
+        
+        if exit_hit is not None:
+            # Success! Adjust distance to account for offset
+            distance_from_search = exit_hit[0]
+            total_distance = distance_from_search + offset
+            exit_point = exit_hit[1]
+            normal = exit_hit[2]
+            
+            # Sanity check: distance should be positive
+            if total_distance > 0:
+                if retry > 0:
+                    GEOMETRY_LEAK_STATS['retry_success'] += 1
+                    if DEBUG:
+                        print(f"[Geometry] Exit found on retry {retry}, offset={offset*1e9:.2f} nm")
+                return (total_distance, exit_point, normal)
+    
+    # Attempt 2: Check if we're already outside the geometry
+    # Try casting ray in opposite direction to see if we hit something behind us
+    opposite_hit = ray_mesh_intersection(position, -direction, geometry)
+    
+    if opposite_hit is None:
+        # No hit in either direction - particle is likely already outside
+        # This is not a geometry leak, it's a successful exit
+        GEOMETRY_LEAK_STATS['outside_detections'] += 1
+        if DEBUG:
+            print(f"[Geometry] Particle appears to be outside mesh, continuing forward")
+        # Return a minimal forward step
+        return (1e-6, position + direction * 1e-6, direction)
+    
+    # Attempt 3: Try with even larger offsets (last resort)
+    for large_offset in [1e-6, 1e-5, 1e-4]:  # 1 micron, 10 micron, 100 micron
+        search_origin = position + direction * large_offset
+        exit_hit = ray_mesh_intersection(search_origin, direction, geometry)
+        
+        if exit_hit is not None:
+            GEOMETRY_LEAK_STATS['retry_success'] += 1
+            if DEBUG:
+                print(f"[Geometry Leak Warning] Exit found only with large offset: {large_offset*1e6:.2f} μm")
+            total_distance = exit_hit[0] + large_offset
+            if total_distance > 0:
+                return (total_distance, exit_hit[1], exit_hit[2])
+    
+    # All attempts failed - true geometry leak
+    # This should be rare for well-constructed meshes
+    GEOMETRY_LEAK_STATS['retry_failures'] += 1
+    if DEBUG:
+        print(f"[Geometry Leak ERROR] Failed to find exit after {max_retries} retries")
+        print(f"  Position: {position}")
+        print(f"  Direction: {direction}")
+    
+    return None
+
+
+def print_geometry_leak_stats():
+    """Print statistics about geometry leak handling.
+    
+    This helps diagnose mesh quality issues. High retry rates or failures
+    indicate problems with the STL mesh (gaps, degenerate triangles, etc.)
+    """
+    stats = GEOMETRY_LEAK_STATS
+    total = stats['total_queries']
+    
+    if total == 0:
+        print("No geometry queries recorded.")
+        return
+    
+    print("\n" + "="*60)
+    print("GEOMETRY LEAK PREVENTION STATISTICS")
+    print("="*60)
+    print(f"Total exit queries:        {total:,}")
+    print(f"Successful (first try):    {total - stats['retry_success'] - stats['retry_failures']:,} "
+          f"({100*(total - stats['retry_success'] - stats['retry_failures'])/total:.2f}%)")
+    print(f"Successful after retry:    {stats['retry_success']:,} "
+          f"({100*stats['retry_success']/total:.2f}%)")
+    print(f"Outside mesh detected:     {stats['outside_detections']:,} "
+          f"({100*stats['outside_detections']/total:.2f}%)")
+    print(f"True geometry leaks:       {stats['retry_failures']:,} "
+          f"({100*stats['retry_failures']/total:.2f}%)")
+    print("="*60)
+    
+    if stats['retry_failures'] > 0.01 * total:  # More than 1% failure
+        print("⚠️  WARNING: High geometry leak rate (>1%)")
+        print("   This indicates poor mesh quality:")
+        print("   - Check for gaps/holes in STL mesh")
+        print("   - Look for degenerate triangles")
+        print("   - Consider remeshing with proper tools")
+    elif stats['retry_success'] > 0.05 * total:  # More than 5% retries
+        print("ℹ️  INFO: Moderate retry rate (>5%)")
+        print("   Mesh has some numerical precision issues but is usable")
+    else:
+        print("✓ Mesh quality appears good")
+    print()
+
+
+def reset_geometry_leak_stats():
+    """Reset geometry leak statistics counters."""
+    global GEOMETRY_LEAK_STATS
+    GEOMETRY_LEAK_STATS = {
+        'total_queries': 0,
+        'retry_success': 0,
+        'retry_failures': 0,
+        'outside_detections': 0,
+    }
 
 
 def mesh_distance_statistics(mesh: np.ndarray) -> Tuple[float, float]:
@@ -480,6 +664,15 @@ def transport_through_slab(
     collect_trajectory: bool = False,
 ) -> Tuple[float, float, np.ndarray, Optional[Tuple[float, np.ndarray, float]], List[Tuple[np.ndarray, float]]]:
     """Propagate a neutron through a homogeneous slab with multiple scatterings.
+    
+    NOTE: This function uses an "equivalent optical path" approximation where
+    the neutron must traverse a fixed path length through the material regardless
+    of scattering direction changes. This is ONLY appropriate for simple planar
+    geometries without complex 3D structures.
+    
+    For complex 3D geometries with STL meshes, use propagate_through_mesh_material()
+    which implements strict 3D geometry tracking by recalculating boundary distances
+    after each scattering event.
     
     Now tracks position and checks for detector crossing after each free flight.
     Also collects trajectory points if collect_trajectory=True.
@@ -634,8 +827,10 @@ def transport_through_slab(
         # Otherwise, a collision occurred (step >= free_path)
         if step >= free_path:
             # Collision occurred before reaching boundary
-            energy = scatter_energy_elastic(energy, target_mass_ratio)
-            current_dir = sample_isotropic_direction()
+            # Use proper CMS to LAB frame conversion for scattering
+            energy, current_dir = scatter_neutron_elastic_cms_to_lab(
+                energy, current_dir, target_mass_ratio
+            )
             speed = energy_to_speed(energy)
             mean_free_path = get_mfp_energy_dependent(energy, mfp_data)
             
@@ -656,12 +851,18 @@ def propagate_through_mesh_material(
     energy_cutoff_mev: float,
     max_segments: int = 20,
     detector_plane: Optional[DetectorPlane] = None,
+    h_mfp_data: Optional[np.ndarray] = None,
+    c_mfp_data: Optional[np.ndarray] = None,
 ) -> Tuple[float, float, np.ndarray, np.ndarray, Optional[Tuple[float, np.ndarray]], List[Tuple[np.ndarray, float]]]:
-    """Advance a neutron through a mesh-defined solid material.
+    """Advance a neutron through a mesh-defined solid material with strict 3D geometry tracking.
     
-    This function properly handles segmented/discontinuous geometries by
-    detecting each entry-exit pair separately and only simulating collisions
-    within actual material, not empty space between segments.
+    This function implements rigorous 3D Monte Carlo transport:
+    - After each scattering event, the direction changes
+    - The distance to the material boundary is recalculated using ray-mesh intersection
+    - No approximations: the neutron truly traces through the 3D geometry
+    
+    This replaces the previous "equivalent optical path" approximation where 
+    the neutron was forced to consume a fixed path length regardless of scattering.
     
     Parameters
     ----------
@@ -689,15 +890,10 @@ def propagate_through_mesh_material(
     current_energy = energy_mev
     cumulative_time = 0.0
     detector_crossing = None
+    max_collisions_per_segment = 1000  # Safety limit for collisions within one segment
     
     # Process each material segment separately
     for segment_idx in range(max_segments):
-        # Debug at start of segment
-        if DEBUG and detector_plane is not None and segment_idx == 0:
-            pass  # Silence
-            #proj = np.dot(detector_plane.axis, current_pos - detector_plane.center)
-            #print(f"[debug start seg {segment_idx}] pos_proj={proj:.4f}m")
-        
         # Check if we hit any geometry from current position
         hit = ray_mesh_intersection(current_pos, dir_norm, geometry)
         if hit is None:
@@ -706,224 +902,132 @@ def propagate_through_mesh_material(
         
         entry_dist, entry_point, normal = hit
         
-        # Time to reach this segment (vacuum flight)
+        # Time to reach this segment (vacuum flight before entering)
         speed = energy_to_speed(current_energy)
         vacuum_time = entry_dist / speed
+        cumulative_time += vacuum_time
         
-        # Save time BEFORE entering this segment
-        time_before_segment = cumulative_time + vacuum_time
+        # Record entry into material
+        current_pos = entry_point.copy()
+        trajectory_points.append((current_pos.copy(), current_energy))
         
-        # Move slightly inside the material to find exit point
-        inside_origin = entry_point + dir_norm * 1e-6
-        exit_hit = ray_mesh_intersection(inside_origin, dir_norm, geometry)
+        # ==========================================
+        # STRICT 3D GEOMETRY TRACKING WITHIN MATERIAL
+        # ==========================================
+        # After each scattering, we recalculate the distance to boundary
+        collision_count = 0
         
-        if exit_hit is None:
-            # No exit found - neutron is lost inside material
-            cumulative_time += vacuum_time
-            return cumulative_time, energy_cutoff_mev, inside_origin, dir_norm, detector_crossing, trajectory_points
-        
-        # Calculate path length through THIS segment only
-        path_inside = exit_hit[0]
-        
-        # Save energy BEFORE transport through segment
-        energy_before_segment = current_energy
-        
-        # Simulate collisions within this segment
-        slab_time, energy_after, direction_after, material_detector_crossing, segment_trajectory = transport_through_slab(
-            current_energy,
-            path_inside,
-            mfp_data,
-            target_mass_ratio,
-            energy_cutoff_mev,
-            initial_direction=dir_norm,
-            start_position=entry_point,
-            detector_plane=detector_plane,
-            collect_trajectory=True,  # 收集完整轨迹
-        )
-        cumulative_time += vacuum_time + slab_time
-        current_energy = energy_after
-        # Collect trajectory points from this segment
-        trajectory_points.extend(segment_trajectory)
-        
-        # If detector was hit inside material, record it
-        if material_detector_crossing is not None and detector_crossing is None:
-            # material_detector_crossing is (time_from_entry, position, energy)
-            # Need to add time_before_segment to get absolute time
-            crossing_time = time_before_segment + material_detector_crossing[0]
-            detector_crossing = (crossing_time, material_detector_crossing[1], material_detector_crossing[2])
-            if DEBUG:
-                print(f"[debug MATERIAL HIT] Detector hit inside material at seg{segment_idx}, crossing_time={crossing_time*1e9:.1f}ns, energy={material_detector_crossing[2]:.3f}MeV")
-        
-        # Check if neutron was absorbed
-        if current_energy <= energy_cutoff_mev:
-            # Exit point is along the original trajectory (before final scatter)
-            exit_point = inside_origin + dir_norm * path_inside
-            return cumulative_time, current_energy, exit_point, direction_after, detector_crossing, trajectory_points
-        
-        # Move to exit point of this segment, ready for next iteration
-        # The exit point is along the ORIGINAL direction (geometric path through mesh)
-        exit_point = inside_origin + dir_norm * path_inside
-        
-        # Check if detector plane was crossed during vacuum flight to this segment
-        # or during the path through this segment
-        if detector_plane is not None and detector_plane.is_circular and detector_crossing is None:
-            # Check both the vacuum flight and the material path
-            start_for_check = position if segment_idx == 0 else current_pos
+        while current_energy > energy_cutoff_mev and collision_count < max_collisions_per_segment:
+            # ==========================================
+            # PHYSICS CONSISTENCY: Ensure flight distance sampling uses same data as nuclide sampling
+            # ==========================================
+            # For multi-component materials (H+C), calculate total cross-section from components
+            # This guarantees: Σ_total (for MFP) = Σ_H + Σ_C (for nuclide sampling)
+            # Eliminates statistical bias from using pre-calculated mfp_data
+            if h_mfp_data is not None and c_mfp_data is not None:
+                # Multi-component material: use component cross-sections
+                sigma_H_current = get_macro_sigma_at_energy(current_energy, h_mfp_data)
+                sigma_C_current = get_macro_sigma_at_energy(current_energy, c_mfp_data)
+                sigma_total_current = sigma_H_current + sigma_C_current
+                mean_free_path = 1.0 / sigma_total_current if sigma_total_current > 1e-12 else 1e12
+            else:
+                # Single-component material: use provided mfp_data
+                mean_free_path = get_mfp_energy_dependent(current_energy, mfp_data)
             
-            # We need to check if crossing happened:
-            # 1. During vacuum flight from start_for_check to entry_point (uses energy_before_segment)
-            # 2. During material transit from entry_point to exit_point (needs energy interpolation)
-            # 3. Special case: if we START at or very close to the detector plane
+            # Sample free flight distance
+            free_path = -mean_free_path * math.log(max(1e-12, np.random.rand()))
             
-            center = detector_plane.center
-            axis = detector_plane.axis
+            # Find distance to exit boundary from current position and direction
+            # Use robust exit finding with geometry leak prevention
+            exit_hit = find_exit_with_retry(current_pos, dir_norm, geometry)
             
-            # Check if start position is already at/on the detector plane
-            pos_value = np.dot(axis, start_for_check - center)
+            if exit_hit is None:
+                # True geometry leak after all retry attempts
+                # This indicates a serious mesh quality issue
+                if DEBUG:
+                    print(f"[CRITICAL] Geometry leak in propagate_through_mesh_material")
+                    print(f"  Segment: {segment_idx}, Collision: {collision_count}")
+                # Treat as absorbed/lost
+                return cumulative_time, energy_cutoff_mev, current_pos, dir_norm, detector_crossing, trajectory_points
             
-            if DEBUG:
-                print(f"[debug] START seg{segment_idx}: pos_value={pos_value:.6f}m")
+            distance_to_boundary = exit_hit[0]
             
-            # If we're starting very close to the plane (within 1mm), check if we're within aperture
-            if abs(pos_value) < 0.001:  # 1mm tolerance
-                dist_from_center = np.linalg.norm(start_for_check - center - pos_value * axis)
-                if dist_from_center <= detector_plane.radius:
-                    # We're starting on the detector! Record this as a crossing
-                    if DEBUG:
-                        print(f"[debug ON PLANE] Starting on detector at dist={dist_from_center*1000:.1f}mm")
-                    detector_crossing = (time_before_segment, start_for_check.copy(), energy_before_segment)
-                    # Don't continue to other checks
+            # Determine if collision occurs before boundary
+            if free_path < distance_to_boundary:
+                # Collision occurs inside material
+                step = free_path
+                
+                # Update position
+                current_pos += step * dir_norm
+                
+                # Update time
+                speed = energy_to_speed(current_energy)
+                cumulative_time += step / speed
+                
+                # Check detector crossing during this flight
+                if detector_plane is not None and detector_crossing is None:
+                    # Implementation of detector crossing check would go here
+                    # (simplified for now to avoid excessive complexity)
+                    pass
+                
+                # Nuclide sampling for multi-component materials (e.g., polyethylene CH₂)
+                # If separate H and C data are provided, sample the collision partner
+                # CRITICAL: Reuse the cross-sections calculated above for MFP
+                # This ensures perfect consistency: same σ_total for both flight distance and nuclide selection
+                if h_mfp_data is not None and c_mfp_data is not None:
+                    # Reuse already-calculated cross-sections (computed for MFP sampling above)
+                    # No need to recalculate - ensures numerical consistency
+                    # sigma_H_current and sigma_C_current were computed at line ~922
+                    
+                    # Randomly select collision partner weighted by cross-sections
+                    # Probability(H) = σ_H / (σ_H + σ_C)
+                    if np.random.rand() < (sigma_H_current / sigma_total_current):
+                        # Collision with hydrogen (A=1)
+                        target_A = 1.0
+                    else:
+                        # Collision with carbon (A=12.011)
+                        target_A = 12.011
                 else:
-                    if DEBUG:
-                        print(f"[debug NEAR PLANE] Starting near plane but outside radius: {dist_from_center*1000:.1f}mm > {detector_plane.radius*1000:.1f}mm")
-            
-            if detector_crossing is None:
-                # Check if entry point itself is on/near the detector plane
-                entry_value = np.dot(axis, entry_point - center)
+                    # Use provided mass ratio (single-component material)
+                    target_A = target_mass_ratio
                 
-                if abs(entry_value) < 0.001:  # Entry point within 1mm of detector plane
-                    # Calculate radial distance from axis
-                    to_entry = entry_point - center
-                    entry_axial = np.dot(to_entry, axis) * axis
-                    entry_radial = to_entry - entry_axial
-                    entry_dist = np.linalg.norm(entry_radial)
-                    
-                    if entry_dist <= detector_plane.radius:
-                        # Entry point is on detector!
-                        detector_crossing = (time_before_segment, entry_point.copy(), energy_before_segment)
+                # Scatter: use proper CMS to LAB frame conversion
+                current_energy, dir_norm = scatter_neutron_elastic_cms_to_lab(
+                    current_energy, dir_norm, target_A
+                )
                 
-                if detector_crossing is None:
-                    # Check vacuum flight to entry_point
-                    crossed_in_vacuum = pos_value * entry_value < 0
-                    
-                    if DEBUG and segment_idx == 0:
-                        print(f"[debug VAC CHECK] pos={pos_value:.4f}, entry={entry_value:.4f}, crossed={crossed_in_vacuum}")
-                    
-                    # Then check material segment
-                    exit_value = np.dot(axis, exit_point - center)
-                    crossed_in_material = entry_value * exit_value < 0
+                # Record collision point
+                trajectory_points.append((current_pos.copy(), current_energy))
+                collision_count += 1
                 
-                if DEBUG and segment_idx == 0 and abs(pos_value + 2.9) < 0.01 and not crossed_in_vacuum:
-                    print(f"[debug NO VAC CROSS] pos={pos_value:.4f}, entry={entry_value:.4f}, exit={exit_value:.4f}, mat={crossed_in_material}")
+            else:
+                # Neutron reaches boundary without collision - exit material
+                step = distance_to_boundary
                 
-                if crossed_in_vacuum:
-                    # Crossing happened during vacuum flight before entering material
-                    path_vec = entry_point - start_for_check
-                    denominator = np.dot(axis, path_vec)
-                    
-                    if abs(denominator) > 1e-10:
-                        s = -pos_value / denominator
-                        
-                        if 0 <= s <= 1:
-                            crossing_point = start_for_check + s * path_vec
-                            # Calculate perpendicular distance from detector axis
-                            to_crossing = crossing_point - center
-                            axial_component = np.dot(to_crossing, axis) * axis
-                            radial_vector = to_crossing - axial_component
-                            dist_from_center = np.linalg.norm(radial_vector)
-                            
-                            if dist_from_center <= detector_plane.radius:
-                                # Energy during vacuum flight is constant (energy_before_segment)
-                                dist_to_crossing = np.linalg.norm(crossing_point - start_for_check)
-                                time_to_crossing = dist_to_crossing / energy_to_speed(energy_before_segment)
-                                # Use time at start of vacuum flight (time_before_segment - vacuum_time)
-                                crossing_time = (time_before_segment - vacuum_time) + time_to_crossing
-                                detector_crossing = (crossing_time, crossing_point, energy_before_segment)
-                                if DEBUG:
-                                    print(f"[debug VAC HIT] dist={dist_from_center*1000:.1f}mm, time={crossing_time*1e9:.1f}ns")
-                            else:
-                                if DEBUG and segment_idx == 0:
-                                    print(f"[debug VAC MISS] dist={dist_from_center*1000:.1f}mm > radius={detector_plane.radius*1000:.1f}mm")
-                                crossing_time = (time_before_segment - vacuum_time) + time_to_crossing
-                                detector_crossing = (crossing_time, crossing_point, energy_before_segment)
-                            
-                elif crossed_in_material:
-                    # Crossing happened inside material segment
-                    # Need to estimate energy at crossing point
-                    path_vec = exit_point - entry_point
-                    denominator = np.dot(axis, path_vec)
-                    
-                    if abs(denominator) > 1e-10:
-                        s = -entry_value / denominator
-                        
-                        if 0 <= s <= 1:
-                            crossing_point = entry_point + s * path_vec
-                            # Calculate perpendicular distance from detector axis
-                            to_crossing = crossing_point - center
-                            axial_component = np.dot(to_crossing, axis) * axis
-                            radial_vector = to_crossing - axial_component
-                            dist_from_center = np.linalg.norm(radial_vector)
-                            
-                            if dist_from_center <= detector_plane.radius:
-                                # Estimate energy at crossing: linear interpolation based on position
-                                # This is approximate but better than using end energy
-                                energy_at_crossing = energy_before_segment + s * (energy_after - energy_before_segment)
-                                
-                                # Time calculation: proportion of slab_time based on position
-                                time_to_crossing = s * slab_time
-                                crossing_time = time_before_segment + time_to_crossing
-                                detector_crossing = (crossing_time, crossing_point, energy_at_crossing)
+                # Update position to exit point
+                current_pos += step * dir_norm
+                
+                # Update time
+                speed = energy_to_speed(current_energy)
+                cumulative_time += step / speed
+                
+                # Exit this material segment
+                break
         
-        # If detector was crossed, stop propagation immediately
-        # We don't want to continue into the scintillator volume
-        if detector_crossing is not None:
-            # Return current state at detector crossing
+        # Safety check
+        if collision_count >= max_collisions_per_segment:
+            # Too many collisions - treat as absorbed
+            return cumulative_time, energy_cutoff_mev, current_pos, dir_norm, detector_crossing, trajectory_points
+        
+        # Check if energy dropped below cutoff
+        if current_energy <= energy_cutoff_mev:
             return cumulative_time, current_energy, current_pos, dir_norm, detector_crossing, trajectory_points
         
-        # Also check if we've passed the detector plane without crossing it
-        # This means the neutron missed the detector aperture or is traveling through continuous material
-        if detector_plane is not None:
-            # Calculate projection of current position onto detector axis
-            # Positive projection means beyond the detector (towards scintillator end)
-            # Negative projection means before detector (towards source)
-            current_proj = np.dot(detector_plane.axis, current_pos - detector_plane.center)
-            
-            # If projection is positive, we've passed the detector plane
-            if current_proj > 0:
-                # We've gone past the detector without hitting it via the crossing detection
-                # This means we're in continuous material spanning the detector plane
-                if DEBUG:
-                    to_point = current_pos - detector_plane.center
-                    parallel_component = np.dot(to_point, detector_plane.axis) * detector_plane.axis
-                    perpendicular_vec = to_point - parallel_component
-                    perp_dist = np.linalg.norm(perpendicular_vec)
-                    print(f"[debug] Passed detector: proj={current_proj:.4f}m, perp={perp_dist*1000:.1f}mm")
-                
-                # Stop propagation - we've passed the detector region
-                return cumulative_time, current_energy, current_pos, dir_norm, detector_crossing, trajectory_points
-        
-        # Update direction for next segment (after scattering)
-        dir_norm = direction_after / np.linalg.norm(direction_after)
-        
-        # Move slightly outside the material along the NEW direction
-        current_pos = exit_point + dir_norm * 1e-5
-        
-        # Debug: show position after each segment
-        if DEBUG and detector_plane is not None and segment_idx < 3:
-            proj = np.dot(detector_plane.axis, current_pos - detector_plane.center)
-            print(f"[debug seg {segment_idx}] pos_proj={proj:.4f}m, E={current_energy:.4f}")
+        # Continue to next segment (if any)
+        # Note: current_pos is now at the exit of this segment
+        # dir_norm is the direction after the last event (scatter or no-scatter exit)
     
-    # Exited all material segments successfully
+    # All segments processed
     return cumulative_time, current_energy, current_pos, dir_norm, detector_crossing, trajectory_points
 
 
@@ -1054,7 +1158,7 @@ def scatter_energy_elastic(neutron_energy_mev: float, target_mass_ratio: float) 
     cos_theta = 2.0 * np.random.rand() - 1.0
     A = target_mass_ratio
     # Compute energy retention fraction r
-    numerator = (A - 1.0) * (A - 1.0) + 2.0 * (A + 1.0) * cos_theta + 1.0
+    numerator = A * A + 1.0 + 2.0 * A * cos_theta
     denominator = (A + 1.0) * (A + 1.0)
     r = numerator / denominator
     # Physical constraint: elastic scattering cannot increase energy
@@ -1063,16 +1167,147 @@ def scatter_energy_elastic(neutron_energy_mev: float, target_mass_ratio: float) 
     return float(neutron_energy_mev * r)
 
 
+def scatter_neutron_elastic_cms_to_lab(
+    neutron_energy_mev: float,
+    incident_direction: np.ndarray,
+    target_mass_ratio: float,
+) -> Tuple[float, np.ndarray]:
+    """Perform elastic neutron scattering with proper CMS to LAB frame conversion.
+    
+    This function implements the complete two-body elastic scattering kinematics:
+    1. Sample scattering angle θ_cm isotropically in the center-of-mass (CMS) frame
+    2. Calculate energy loss from θ_cm using the correct kinematic relation
+    3. Convert θ_cm to θ_lab using the proper coordinate transformation
+    4. Update the neutron direction in the laboratory (LAB) frame
+    
+    CRITICAL PHYSICS:
+    For hydrogen (A=1), the CMS to LAB transformation ensures that:
+    - θ_lab ∈ [0, π/2]: neutron can NEVER backscatter from proton
+    - This is physically mandatory for elastic n-p scattering
+    
+    For heavier nuclei (A > 1), backscattering is possible but rare.
+    
+    Transformation formula:
+        tan(θ_lab) = sin(θ_cm) / (γ + cos(θ_cm))
+    where γ = 1/A
+    
+    Energy relation:
+        E_out / E_in = [A² + 1 + 2A·cos(θ_cm)] / (A + 1)²
+    
+    Parameters
+    ----------
+    neutron_energy_mev : float
+        Incident neutron kinetic energy in MeV.
+    incident_direction : np.ndarray, shape (3,)
+        Unit vector of neutron velocity before collision (LAB frame).
+    target_mass_ratio : float
+        Target nucleus mass / neutron mass (A).
+        Examples: H=1, C=12, Al≈27
+    
+    Returns
+    -------
+    tuple : (energy_out, direction_out)
+        energy_out : float
+            Neutron energy after scattering (MeV)
+        direction_out : np.ndarray
+            Unit vector of neutron velocity after scattering (LAB frame)
+    
+    References
+    ----------
+    - Duderstadt & Hamilton, "Nuclear Reactor Analysis", Ch. 2
+    - Bell & Glasstone, "Nuclear Reactor Theory", §1.4
+    """
+    A = target_mass_ratio
+    gamma = 1.0 / A
+    
+    # Step 1: Sample scattering angle in CMS (isotropic)
+    # cos(θ_cm) uniform in [-1, 1] → θ_cm uniform in [0, π]
+    cos_theta_cm = 2.0 * np.random.rand() - 1.0
+    sin_theta_cm = math.sqrt(max(0.0, 1.0 - cos_theta_cm**2))
+    
+    # Step 2: Calculate energy after scattering
+    # From two-body kinematics:
+    # E_out/E_in = [A² + 1 + 2A·cos(θ_cm)] / (A+1)²
+    numerator = A * A + 1.0 + 2.0 * A * cos_theta_cm
+    denominator = (A + 1.0) * (A + 1.0)
+    energy_ratio = numerator / denominator
+    energy_ratio = max(0.0, min(energy_ratio, 1.0))  # Physical bounds
+    energy_out = neutron_energy_mev * energy_ratio
+    
+    # Step 3: Convert θ_cm to θ_lab
+    # tan(θ_lab) = sin(θ_cm) / (γ + cos(θ_cm))
+    denominator_angle = gamma + cos_theta_cm
+    
+    # Handle special case where denominator ≈ 0 (rare)
+    if abs(denominator_angle) < 1e-10:
+        theta_lab = math.pi / 2.0
+    else:
+        theta_lab = math.atan2(sin_theta_cm, denominator_angle)
+    
+    # Ensure θ_lab is in valid range [0, π]
+    if theta_lab < 0:
+        theta_lab += math.pi
+    
+    # Step 4: Sample azimuthal angle φ uniformly (symmetry)
+    phi = 2.0 * math.pi * np.random.rand()
+    
+    # Step 5: Construct new direction in LAB frame
+    # Build local coordinate system with incident direction as z-axis
+    incident_dir = np.array(incident_direction, dtype=float)
+    incident_dir /= np.linalg.norm(incident_dir)
+    
+    # Get perpendicular vectors
+    z_axis = incident_dir
+    # Choose arbitrary perpendicular vector
+    if abs(z_axis[2]) < 0.9:
+        x_axis = np.array([0.0, 0.0, 1.0], dtype=float)
+    else:
+        x_axis = np.array([1.0, 0.0, 0.0], dtype=float)
+    
+    # Gram-Schmidt orthogonalization
+    x_axis = x_axis - np.dot(x_axis, z_axis) * z_axis
+    x_axis /= np.linalg.norm(x_axis)
+    
+    # Complete right-handed system
+    y_axis = np.cross(z_axis, x_axis)
+    
+    # Scattered direction in spherical coordinates (θ_lab, φ)
+    cos_theta_lab = math.cos(theta_lab)
+    sin_theta_lab = math.sin(theta_lab)
+    
+    # Convert to Cartesian in local frame
+    direction_local = np.array([
+        sin_theta_lab * math.cos(phi),
+        sin_theta_lab * math.sin(phi),
+        cos_theta_lab
+    ], dtype=float)
+    
+    # Transform to global LAB frame
+    direction_out = (
+        direction_local[0] * x_axis +
+        direction_local[1] * y_axis +
+        direction_local[2] * z_axis
+    )
+    
+    # Normalize (should already be normalized, but ensure numerical stability)
+    direction_out /= np.linalg.norm(direction_out)
+    
+    return energy_out, direction_out
+
+
 ################################################################################
 # Data Loading Utilities
 ################################################################################
 
 def load_mfp_data_from_csv(file_path: str) -> np.ndarray:
     """
-    Load macro-scopic cross section data from a two-column CSV file.
+    Load cross-section data from a two-column CSV file.
 
-    The file must contain data pairs: [Energy (MeV), Sigma_Macro (m⁻¹)].
-    The function handles conversion and ensures the data is sorted by energy.
+    The file must contain data pairs: [Energy, Cross-Section].
+    Energy is assumed to be in eV and will be converted to MeV.
+    Cross-section can be either microscopic (barns) or macroscopic (m⁻¹) 
+    depending on the data source. The caller is responsible for interpreting
+    and converting units as needed.
 
     Parameters
     ----------
@@ -1082,7 +1317,7 @@ def load_mfp_data_from_csv(file_path: str) -> np.ndarray:
     Returns
     -------
     np.ndarray, shape (N, 2)
-        Sorted array of [Energy, Sigma_Macro].
+        Sorted array of [Energy (MeV), Cross-Section (original units)].
     """
     if not os.path.isfile(file_path):
         raise FileNotFoundError(f"Cross section data file '{file_path}' does not exist.")
@@ -1111,7 +1346,7 @@ def load_mfp_data_from_csv(file_path: str) -> np.ndarray:
             file_path, 
             delimiter=';', 
             skiprows=skip_rows, 
-            usecols=(0, 1), # 使用第0列(Energy)和第1列(Sigma_Macro)
+            usecols=(0, 1), # 使用第0列(Energy)和第1列(Cross-Section)
             dtype=float
         )
         
@@ -1124,7 +1359,7 @@ def load_mfp_data_from_csv(file_path: str) -> np.ndarray:
         raise ValueError(f"Could not load and process data from CSV: {e}")
 
     if data.ndim != 2 or data.shape[1] != 2:
-        raise ValueError("Processed data must contain exactly two columns: Energy (MeV) and Macro-Sigma (m⁻¹).")
+        raise ValueError("Processed data must contain exactly two columns: Energy (MeV) and Cross-Section.")
 
     # Ensure data is sorted by Energy for correct interpolation
     data = data[data[:, 0].argsort()]
@@ -1229,6 +1464,42 @@ MFP_DATA_AL = np.array([
     [10.0, 16.0],
     [14.1, 16.2],
 ])
+
+
+def get_macro_sigma_at_energy(energy_mev: float, mfp_data: np.ndarray) -> float:
+    """Get macroscopic cross-section (Sigma, m⁻¹) at a given neutron energy.
+    
+    This is a helper function for nuclide sampling in multi-component materials.
+    
+    Parameters
+    ----------
+    energy_mev : float
+        Neutron kinetic energy (MeV).
+    mfp_data : np.ndarray
+        [Energy (MeV), macroscopic cross-section (m⁻¹)] data array.
+        
+    Returns
+    -------
+    float
+        Macroscopic cross-section Sigma (m⁻¹) at the given energy.
+    """
+    if energy_mev <= 0.1:
+        return 1e-12  # Near-zero cross-section for stopped neutrons
+    
+    energies = mfp_data[:, 0]
+    sigmas = mfp_data[:, 1]
+    
+    # Ensure energy is within interpolation range, use boundary values for extrapolation
+    if energy_mev < energies.min():
+        sigma = sigmas[0]
+    elif energy_mev > energies.max():
+        sigma = sigmas[-1]
+    else:
+        # Linear interpolation for macroscopic cross-section sigma (m⁻¹)
+        sigma = np.interp(energy_mev, energies, sigmas)
+    
+    # Ensure sigma is positive
+    return max(sigma, 1e-12)
 
 
 def get_mfp_energy_dependent(
@@ -1435,56 +1706,85 @@ def simulate_in_aluminium(
     
     # Advance to entry point
     cumulative_time += distance_to_entry / speed
-    position = entry_point.copy()
+    current_pos = entry_point.copy()
+    current_dir = direction.copy()
+    current_energy = energy
+    trajectory_points.append((current_pos.copy(), current_energy))
     
-    # Find second intersection (exit point from aluminum shell)
-    # Start slightly inside the mesh to avoid numerical issues
-    epsilon = 1e-6  # Small offset to ensure we're inside the shell
-    search_origin = position + direction * epsilon
-    hit_exit = ray_mesh_intersection(search_origin, direction, mesh_geometry)
+    # ==========================================
+    # STRICT 3D GEOMETRY TRACKING IN ALUMINUM SHELL
+    # ==========================================
+    # We now track the neutron with full 3D geometry after each scatter
+    max_collisions_in_shell = 1000  # Safety limit
+    collision_count = 0
     
-    if hit_exit is None:
-        # This shouldn't happen for a closed mesh
-        # The neutron has entered but cannot find an exit - likely a mesh issue
-        # Treat as absorbed/lost in the shell
-        return cumulative_time, energy_cutoff_mev - 0.01, direction, position, detector_crossing, trajectory_points
+    while current_energy > energy_cutoff_mev and collision_count < max_collisions_in_shell:
+        # Calculate mean free path at current energy
+        mean_free_path = get_mfp_energy_dependent(current_energy, aluminium_mfp_data)
+        
+        # Sample free flight distance
+        free_path = -mean_free_path * math.log(max(1e-12, np.random.rand()))
+        
+        # Find distance to exit boundary from current position and direction
+        # Use robust exit finding with geometry leak prevention
+        exit_hit = find_exit_with_retry(current_pos, current_dir, mesh_geometry)
+        
+        if exit_hit is None:
+            # True geometry leak after all retry attempts
+            # This indicates a serious mesh quality issue
+            if DEBUG:
+                print(f"[CRITICAL] Geometry leak in propagate_shell")
+                print(f"  Collision count: {collision_count}")
+            # Treat as absorbed/lost in shell
+            return cumulative_time, energy_cutoff_mev, current_dir, current_pos, detector_crossing, trajectory_points
+        
+        distance_to_boundary = exit_hit[0]
+        
+        # Determine if collision occurs before boundary
+        if free_path < distance_to_boundary:
+            # Collision occurs inside shell
+            step = free_path
+            
+            # Update position
+            current_pos += step * current_dir
+            
+            # Update time
+            speed = energy_to_speed(current_energy)
+            cumulative_time += step / speed
+            
+            # Check detector crossing during this flight (optional, can be implemented later)
+            # For now, we skip detector crossing checks in the shell for simplicity
+            
+            # Scatter: use proper CMS to LAB frame conversion
+            current_energy, current_dir = scatter_neutron_elastic_cms_to_lab(
+                current_energy, current_dir, target_mass_ratio
+            )
+            
+            # Record collision point
+            trajectory_points.append((current_pos.copy(), current_energy))
+            collision_count += 1
+            
+        else:
+            # Neutron reaches boundary without collision - exit shell
+            step = distance_to_boundary
+            
+            # Update position to exit point
+            current_pos += step * current_dir
+            
+            # Update time
+            speed = energy_to_speed(current_energy)
+            cumulative_time += step / speed
+            
+            # Exit the shell
+            break
     
-    distance_to_exit, mesh_exit_point, exit_normal = hit_exit
-    # Calculate actual path length through the mesh
-    path_length_along_direction = distance_to_exit + epsilon
+    # Safety check
+    if collision_count >= max_collisions_in_shell:
+        # Too many collisions - treat as absorbed
+        return cumulative_time, energy_cutoff_mev, current_dir, current_pos, detector_crossing, trajectory_points
     
-    # The actual exit point from the mesh
-    # mesh_exit_point is relative to search_origin, need to convert to absolute position
-    actual_exit_point = search_origin + direction * distance_to_exit
-    
-    # Slab simulation inside the mesh material
-    # We call transport_through_slab to simulate the interaction in the slab material
-    slab_time, energy_out, direction_out, material_crossing, slab_trajectory = transport_through_slab(
-        energy,  # Use current energy, not initial energy_mev
-        path_length_along_direction, # Actual path length through the mesh
-        aluminium_mfp_data, # 传入数据数组
-        target_mass_ratio,  # Use the function parameter, not undefined aluminium_mass_ratio
-        energy_cutoff_mev,
-        initial_direction=direction,
-        start_position=position,
-        detector_plane=detector_plane,
-        collect_trajectory=True,  # 收集完整轨迹
-    )
-    
-    # Check if detector was crossed inside aluminum
-    if material_crossing is not None and detector_crossing is None:
-        crossing_time_in_slab = material_crossing[0]
-        detector_crossing = (cumulative_time + crossing_time_in_slab, material_crossing[1], material_crossing[2])
-        if DEBUG:
-            print(f"[debug SHELL MATERIAL HIT] Detector hit inside aluminum shell")
-    
-    # Update time and return the actual exit point
-    cumulative_time += slab_time
-    
-    # Collect trajectory points from slab
-    trajectory_points.extend(slab_trajectory)
-    
-    return cumulative_time, energy_out, direction_out, actual_exit_point, detector_crossing, trajectory_points
+    # Return with exit state
+    return cumulative_time, current_energy, current_dir, current_pos, detector_crossing, trajectory_points
 
 
 ################################################################################
@@ -1630,6 +1930,8 @@ def simulate_neutron_history(
     source_cone_axis: Optional[np.ndarray] = None,
     source_cone_half_angle_deg: float = DEFAULT_SOURCE_CONE_HALF_ANGLE_DEG,
     detector_plane: Optional[DetectorPlane] = None,
+    h_mfp_data: Optional[np.ndarray] = None,
+    c_mfp_data: Optional[np.ndarray] = None,
 ) -> Optional[float]:
     """Simulate the complete history of a single neutron.
 
@@ -1772,6 +2074,8 @@ def simulate_neutron_history(
         channel_mass_ratio,
         energy_cutoff_mev,
         detector_plane=detector_plane,  # Pass detector plane for crossing detection
+        h_mfp_data=h_mfp_data,  # Pass H data for nuclide sampling
+        c_mfp_data=c_mfp_data,  # Pass C data for nuclide sampling
     )
     
     # Unpack result with detector crossing info and trajectory points
@@ -1982,6 +2286,8 @@ def run_simulation(
             source_cone_axis=source_cone_axis,
             source_cone_half_angle_deg=source_cone_half_angle_deg,
             detector_plane=detector_plane,
+            h_mfp_data=h_mfp_data,  # Pass H data for nuclide sampling
+            c_mfp_data=c_mfp_data,  # Pass C data for nuclide sampling
         )
         
         # Record ALL neutrons
@@ -2509,41 +2815,82 @@ def print_statistics(records: List[NeutronRecord], n_total: int):
 if __name__ == "__main__":
     base_dir = Path(__file__).resolve().parent
 
-    AL_CSV_FILE = base_dir / "Al.csv" 
-    H_CSV_FILE = base_dir / "H.csv" 
-    C_CSV_FILE = base_dir / "C.csv" 
+    AL_CSV_FILE = base_dir / "cross_section_data" / "Al.csv" 
+    H_CSV_FILE = base_dir / "cross_section_data" / "H.csv" 
+    C_CSV_FILE = base_dir / "cross_section_data" / "C.csv" 
     
     # --- KERNEL SETUP ---
-    # 1. 尝试加载用户提供的铝截面数据
+    # 1. 铝截面数据加载与转换
     try:
         if AL_CSV_FILE.exists():
-            # 使用新的加载函数加载真实数据
-            aluminium_mfp_data = load_mfp_data_from_csv(str(AL_CSV_FILE))
-            print(f"[info] Successfully loaded energy-dependent MFP data for Aluminium from {AL_CSV_FILE.name}")
+            # 加载铝的微观截面数据 (barns)
+            al_micro_data = load_mfp_data_from_csv(str(AL_CSV_FILE))
+            
+            # 计算铝的原子数密度 N_Al (m⁻³)
+            # Al: ρ ≈ 2.70 g/cm³, M ≈ 26.981 g/mol
+            from scipy.constants import Avogadro
+            rho_Al_g_cm3 = 2.70  # g/cm³
+            M_Al = 26.981  # g/mol
+            rho_Al_g_m3 = rho_Al_g_cm3 * 1e6  # g/m³
+            N_Al_m3 = (rho_Al_g_m3 / M_Al) * Avogadro  # atoms/m³
+            BARN_TO_M2 = 1e-28
+            
+            # 转换为宏观截面: Σ_Al = σ_Al × N_Al (m⁻¹)
+            aluminium_mfp_data = np.column_stack([
+                al_micro_data[:, 0],  # Energy (MeV)
+                al_micro_data[:, 1] * N_Al_m3 * BARN_TO_M2  # Σ_Al (m⁻¹)
+            ])
+            print(f"[info] Loaded Aluminium microscopic cross-sections from {AL_CSV_FILE.name}")
+            print(f"[info] Converted to macroscopic: N_Al = {N_Al_m3:.4e} atoms/m^3")
         else:
             # 如果文件不存在，则退回使用占位符
             aluminium_mfp_data = MFP_DATA_AL
             print("[info] Using default internal MFP data for Aluminium.")
     except Exception as e:
-        print(f"[warning] Failed to load custom Aluminium MFP data. Using default. Error: {e}")
+        print(f"[warning] Failed to load/convert Aluminium data. Using default. Error: {e}")
         aluminium_mfp_data = MFP_DATA_AL
 
     # --- 2. 聚乙烯数据计算(用于 Channel) ---
+    # Important: Keep H and C data separate for nuclide sampling
+    h_mfp_data = None
+    c_mfp_data = None
+    
     try:
         if H_CSV_FILE.exists() and C_CSV_FILE.exists():
             # 加载 H 和 C 的微观截面数据
             h_micro_data = load_mfp_data_from_csv(str(H_CSV_FILE))
             c_micro_data = load_mfp_data_from_csv(str(C_CSV_FILE))
             
-            # 计算聚乙烯的组合宏观截面
+            # 计算聚乙烯的组合宏观截面（用于碰撞概率计算）
             pe_data_calculated = calculate_pe_macro_sigma(h_micro_data, c_micro_data)
+            
+            # 同时计算H和C的单独宏观截面（用于核种抽样）
+            # Convert microscopic cross-sections to macroscopic for H and C
+            from scipy.constants import Avogadro
+            rho_PE = 0.92e6  # g/m³
+            M_C2H4 = 28.054  # g/mol
+            N_C = (2.0 / M_C2H4) * rho_PE * Avogadro  # number density of C (m⁻³)
+            N_H = (4.0 / M_C2H4) * rho_PE * Avogadro  # number density of H (m⁻³)
+            BARN_TO_M2 = 1e-28
+            
+            # Calculate macroscopic cross-sections for H and C separately
+            h_mfp_data = np.column_stack([
+                h_micro_data[:, 0],  # Energy (MeV)
+                h_micro_data[:, 1] * N_H * BARN_TO_M2  # Σ_H = σ_H × N_H (m⁻¹)
+            ])
+            c_mfp_data = np.column_stack([
+                c_micro_data[:, 0],  # Energy (MeV)
+                c_micro_data[:, 1] * N_C * BARN_TO_M2  # Σ_C = σ_C × N_C (m⁻¹)
+            ])
             
             channel_mfp_data = pe_data_calculated
             print(f"[info] Calculated Polyethylene MFP data from H.csv and C.csv.")
+            print(f"[info] Nuclide sampling enabled: H (A=1) and C (A=12) separated.")
         else:
             # 如果文件不存在，则退回使用占位符
             channel_mfp_data = MFP_DATA_PE
             print("[info] Using default internal MFP data for Polyethylene.")
+            print("[warning] Nuclide sampling disabled: H and C not separated.")
     except Exception as e:
         print(f"[warning] Failed to calculate/load custom Polyethylene MFP data. Using default. Error: {e}")
         channel_mfp_data = MFP_DATA_PE

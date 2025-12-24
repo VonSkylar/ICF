@@ -79,6 +79,8 @@ def plot_meshes_mm(
     ax.set_title(title)
     ax.legend(loc="upper right")
     plt.tight_layout()
+    plt.savefig('Figures/stl_geometry_visualization.png', dpi=150)
+    print("\n✓ STL geometry plot displayed.")
     plt.show()
 
 
