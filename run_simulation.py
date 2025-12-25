@@ -26,6 +26,8 @@ import numpy as np
 
 # Import from the modular package
 from icf_simulation import (
+    # Configuration
+    config,
     # Constants
     DEFAULT_SOURCE_CONE_HALF_ANGLE_DEG,
     BARN_TO_M2,
@@ -60,9 +62,9 @@ def main():
     # =========================================================================
     # 1. Load Cross-Section Data
     # =========================================================================
-    AL_CSV_FILE = base_dir / "cross_section_data" / "Al.csv" 
-    H_CSV_FILE = base_dir / "cross_section_data" / "H.csv" 
-    C_CSV_FILE = base_dir / "cross_section_data" / "C.csv" 
+    AL_CSV_FILE = base_dir / config.CROSS_SECTION_DIR / config.AL_CROSS_SECTION_FILE
+    H_CSV_FILE = base_dir / config.CROSS_SECTION_DIR / config.H_CROSS_SECTION_FILE
+    C_CSV_FILE = base_dir / config.CROSS_SECTION_DIR / config.C_CROSS_SECTION_FILE 
     
     # Load Aluminium cross-section data
     try:
@@ -70,8 +72,8 @@ def main():
             from scipy.constants import Avogadro
             al_micro_data = load_mfp_data_from_csv(str(AL_CSV_FILE))
             
-            rho_Al_g_cm3 = 2.70  # g/cm³
-            M_Al = 26.981  # g/mol
+            rho_Al_g_cm3 = config.AL_DENSITY_G_CM3
+            M_Al = config.AL_MOLAR_MASS
             rho_Al_g_m3 = rho_Al_g_cm3 * 1e6  # g/m³
             N_Al_m3 = (rho_Al_g_m3 / M_Al) * Avogadro  # atoms/m³
             
@@ -102,10 +104,10 @@ def main():
             pe_data_calculated = calculate_pe_macro_sigma(h_micro_data, c_micro_data)
             
             # Calculate separate macroscopic cross-sections for H and C (for nuclide sampling)
-            rho_PE = 0.92e6  # g/m³
-            M_C2H4 = 28.054  # g/mol
-            N_C = (2.0 / M_C2H4) * rho_PE * Avogadro  # number density of C (m⁻³)
-            N_H = (4.0 / M_C2H4) * rho_PE * Avogadro  # number density of H (m⁻³)
+            rho_PE = config.PE_DENSITY_G_CM3 * 1e6  # Convert g/cm³ to g/m³
+            M_C2H4 = config.PE_MOLAR_MASS
+            N_C = (config.C_ATOMS_PER_MOLECULE / M_C2H4) * rho_PE * Avogadro  # number density of C (m⁻³)
+            N_H = (config.H_ATOMS_PER_MOLECULE / M_C2H4) * rho_PE * Avogadro  # number density of H (m⁻³)
             
             h_mfp_data = np.column_stack([
                 h_micro_data[:, 0],  # Energy (MeV)
@@ -130,25 +132,24 @@ def main():
     # =========================================================================
     # 2. Load STL Geometry Files
     # =========================================================================
-    stl_file_path: Optional[Path] = None
-    for candidate in ("Target ball model.stl", "Target_ball_model.stl"):
-        path = base_dir / candidate
-        if path.exists():
-            stl_file_path = path
-            break
-    if stl_file_path is None:
-        stl_candidates = sorted(base_dir.glob("*.stl"))
-        if not stl_candidates:
-            raise FileNotFoundError("No STL geometry file found in the current directory.")
-        stl_file_path = stl_candidates[0]
-        print(f"[info] Using STL file: {stl_file_path.name}")
-
-    shell_mesh = load_stl_mesh(str(stl_file_path))
-    channel_mesh_path = base_dir / "nTOF_without_scintillant.STL"
-    channel_mesh = load_stl_mesh(str(channel_mesh_path))
+    stl_dir = base_dir / config.STL_MODEL_DIR
+    
+    shell_stl_path = stl_dir / config.SHELL_STL_FILE
+    channel_stl_path = stl_dir / config.CHANNEL_STL_FILE
+    
+    if not shell_stl_path.exists():
+        raise FileNotFoundError(f"Shell STL not found: {shell_stl_path}")
+    if not channel_stl_path.exists():
+        raise FileNotFoundError(f"Channel STL not found: {channel_stl_path}")
+    
+    print(f"[info] Loading shell STL: {shell_stl_path.name}")
+    shell_mesh = load_stl_mesh(str(shell_stl_path))
+    
+    print(f"[info] Loading channel STL: {channel_stl_path.name}")
+    channel_mesh = load_stl_mesh(str(channel_stl_path))
     
     # Convert millimetres to metres
-    unit_scale = 1.0e-3
+    unit_scale = config.MM_TO_M
     mesh_scaled = shell_mesh * unit_scale
     channel_scaled = channel_mesh * unit_scale
     
@@ -159,13 +160,13 @@ def main():
     # =========================================================================
     # 3. Configure Coordinate System and Detector
     # =========================================================================
-    # Channel axis direction: [0, 0, 1] (positive Z direction)
-    channel_axis = np.array([0.0, 0.0, 1.0])
+    # Channel axis direction from config
+    channel_axis = np.array(config.CHANNEL_AXIS)
     
-    # Detector configuration
-    detector_z_mm = 2900.0  # Distance along channel axis (mm)
+    # Detector configuration from config
+    detector_z_mm = config.DETECTOR_Z_MM
     detector_center_mm = np.array([0.0, 0.0, detector_z_mm])
-    detector_radius_mm = 105.0  # Detector radius (mm)
+    detector_radius_mm = config.DETECTOR_RADIUS_MM
     detector_plane = build_circular_detector_plane(detector_center_mm, detector_radius_mm, channel_axis)
 
     # Shell thickness (calculated from STL mesh geometry)
@@ -188,10 +189,10 @@ def main():
     # =========================================================================
     # 4. Run Simulation
     # =========================================================================
-    # Simulation parameters (adjust as needed)
-    n_neutrons = 100  # Number of neutron histories to simulate
-    aluminium_mass_ratio = 26.98  # Mass ratio A for aluminium
-    channel_mass_ratio = 1.0  # Mass ratio for polyethylene (dominated by H)
+    # Simulation parameters from config (can be overridden)
+    n_neutrons = config.DEFAULT_N_NEUTRONS
+    aluminium_mass_ratio = config.AL_MASS_RATIO
+    channel_mass_ratio = config.PE_MASS_RATIO
 
     print(f"[info] Starting simulation with {n_neutrons} neutrons...")
     
@@ -202,7 +203,7 @@ def main():
         aluminium_mfp_data=aluminium_mfp_data,
         detector_distance=detector_plane.plane_position,
         detector_side=1.0,
-        energy_cutoff_mev=0.1,
+        energy_cutoff_mev=config.DEFAULT_ENERGY_CUTOFF_MEV,
         shell_geometry=shell_geometry,
         channel_geometry=channel_geometry,
         channel_mfp_data=channel_mfp_data,
@@ -220,11 +221,11 @@ def main():
     
     # Export neutron data to CSV
     if neutron_records:
-        csv_filename = str(base_dir / "Data" / "neutron_data.csv")
+        csv_filename = str(base_dir / config.DATA_OUTPUT_DIR / config.NEUTRON_DATA_CSV)
         export_neutron_records_to_csv(neutron_records, filename=csv_filename)
         
         # Export trajectory data
-        trajectory_filename = str(base_dir / "Data" / "neutron_trajectories.csv")
+        trajectory_filename = str(base_dir / config.DATA_OUTPUT_DIR / config.TRAJECTORY_DATA_CSV)
         export_neutron_trajectories_to_csv(neutron_records, filename=trajectory_filename)
     
     # =========================================================================
@@ -232,7 +233,7 @@ def main():
     # =========================================================================
     if neutron_records:
         print("[info] Generating visualizations...")
-        save_base = str(base_dir / "Figures" / "neutron_analysis")
+        save_base = str(base_dir / config.FIGURES_OUTPUT_DIR / config.NEUTRON_ANALYSIS_FIGURE_BASE)
         visualize_neutron_data(neutron_records, save_path=save_base)
         visualize_detector_hits(neutron_records, detector_plane, save_path=save_base)
         print("[info] Visualization complete!")

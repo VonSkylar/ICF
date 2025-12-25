@@ -18,7 +18,7 @@ from pathlib import Path
 from collections import defaultdict
 
 # Import from icf_simulation package
-from icf_simulation import load_stl_mesh
+from icf_simulation import load_stl_mesh, config
 
 
 def load_neutron_trajectory_data(csv_file):
@@ -126,69 +126,52 @@ def plot_neutron_trajectories_3d(trajectories, max_trajectories=100, save_path=N
     # Load and display geometry if requested
     if show_geometry:
         if stl_dir is None:
-            stl_dir = Path(__file__).resolve().parent
+            # Use STL_model directory from config
+            base_dir = Path(__file__).resolve().parent
+            stl_dir = base_dir / config.STL_MODEL_DIR
         else:
             stl_dir = Path(stl_dir)
         
-        unit_scale = 1.0e-3  # Convert mm to m
+        unit_scale = config.MM_TO_M  # Convert mm to m
         
-        # Load and plot aluminum shell
-        shell_file = None
-        for candidate in ["Target ball model.stl", "Target_ball_model.stl"]:
-            path = stl_dir / candidate
-            if path.exists():
-                shell_file = path
-                break
+        # Define STL files to load with their properties
+        stl_geometries = [
+            (config.SHELL_STL_FILE, "Aluminum shell", config.STL_SHELL_ALPHA, config.STL_SHELL_COLOR),
+            (config.CHANNEL_STL_FILE, "Polyethylene channel", config.STL_CHANNEL_ALPHA, config.STL_CHANNEL_COLOR),
+        ]
         
-        if shell_file and shell_file.exists():
+        # Load and plot all STL geometries
+        for filename, label, alpha, color in stl_geometries:
+            stl_path = stl_dir / filename
+            
+            if not stl_path.exists():
+                print(f"[warning] {label} STL not found at {stl_path}, skipping.")
+                continue
+            
             try:
-                print(f"[info] Loading aluminum shell from {shell_file.name}...")
-                shell_mesh = load_stl_mesh(str(shell_file))
+                print(f"[info] Loading {label} from {filename}...")
+                mesh = load_stl_mesh(str(stl_path))
+                
                 # Handle new format: (n, 4, 3) with normals -> extract vertices only
-                if shell_mesh.shape[1] == 4:
-                    shell_mesh = shell_mesh[:, 1:, :]  # Shape becomes (n, 3, 3)
-                shell_mesh_scaled = shell_mesh * unit_scale
+                if mesh.shape[1] == 4:
+                    mesh = mesh[:, 1:, :]  # Shape becomes (n, 3, 3)
                 
-                num_triangles = len(shell_mesh_scaled)
-                # Use all triangles for complete geometry visualization
-                shell_triangles = [triangle for triangle in shell_mesh_scaled]
+                mesh_scaled = mesh * unit_scale
+                num_triangles = len(mesh_scaled)
                 
-                # Plot shell with very low transparency to avoid blocking trajectories
-                shell_collection = Poly3DCollection(shell_triangles, alpha=0.12, 
-                                                   facecolor='lightgray', edgecolor='none', 
-                                                   linewidths=0)
-                ax.add_collection3d(shell_collection)
-                print(f"[info] Aluminum shell loaded: {num_triangles} triangles displayed")
+                # Create polygon collection
+                triangles = [triangle for triangle in mesh_scaled]
+                collection = Poly3DCollection(triangles, alpha=alpha, 
+                                            facecolor=color, edgecolor='none', 
+                                            linewidths=0)
+                ax.add_collection3d(collection)
+                print(f"[info] {label} loaded: {num_triangles} triangles displayed")
             except Exception as e:
-                print(f"[warning] Could not load aluminum shell: {e}")
+                print(f"[warning] Could not load {label}: {e}")
         
-        # Load and plot polyethylene channel
-        channel_file = stl_dir / "nTOF_without_scintillant.STL"
-        if channel_file.exists():
-            try:
-                print(f"[info] Loading polyethylene channel from {channel_file.name}...")
-                channel_mesh = load_stl_mesh(str(channel_file))
-                # Handle new format: (n, 4, 3) with normals -> extract vertices only
-                if channel_mesh.shape[1] == 4:
-                    channel_mesh = channel_mesh[:, 1:, :]  # Shape becomes (n, 3, 3)
-                channel_mesh_scaled = channel_mesh * unit_scale
-                
-                num_triangles = len(channel_mesh_scaled)
-                # Use all triangles for complete geometry visualization
-                channel_triangles = [triangle for triangle in channel_mesh_scaled]
-                
-                # Plot channel with low transparency
-                channel_collection = Poly3DCollection(channel_triangles, alpha=0.2, 
-                                                     facecolor='lightblue', edgecolor='none', 
-                                                     linewidths=0)
-                ax.add_collection3d(channel_collection)
-                print(f"[info] Polyethylene channel loaded: {num_triangles} triangles displayed")
-            except Exception as e:
-                print(f"[warning] Could not load polyethylene channel: {e}")
-        
-        # Draw detector plane (circular, at z=2.9m, radius=105mm)
-        detector_z = 2.9  # meters
-        detector_radius = 0.105  # meters
+        # Draw detector plane (using config values)
+        detector_z = config.DETECTOR_Z_MM * config.MM_TO_M  # Convert mm to meters
+        detector_radius = config.DETECTOR_RADIUS_MM * config.MM_TO_M  # Convert mm to meters
         theta = np.linspace(0, 2*np.pi, 100)
         x_circle = detector_radius * np.cos(theta)
         y_circle = detector_radius * np.sin(theta)
@@ -451,7 +434,7 @@ if __name__ == "__main__":
     figures_dir = script_dir / "Figures"
     
     # Load trajectory data
-    trajectory_file = data_dir / "neutron_trajectories.csv"
+    trajectory_file = data_dir / config.TRAJECTORY_DATA_CSV
     
     if not trajectory_file.exists():
         print(f"[error] Trajectory file not found: {trajectory_file}")
@@ -463,12 +446,12 @@ if __name__ == "__main__":
         print(f"[info] Loaded {len(trajectories)} neutron trajectories")
         
         # Create visualizations
-        save_base = str(figures_dir / "neutron_trajectories")
+        save_base = str(figures_dir / config.TRAJECTORY_FIGURE_BASE)
         
         print("[info] Creating 3D trajectory plot...")
-        plot_neutron_trajectories_3d(trajectories, max_trajectories=100, save_path=save_base)
+        plot_neutron_trajectories_3d(trajectories, max_trajectories=config.MAX_TRAJECTORIES_TO_PLOT, save_path=save_base)
         
         print("[info] Creating 2D projection plots...")
-        plot_trajectories_2d_projections(trajectories, max_trajectories=100, save_path=save_base)
+        plot_trajectories_2d_projections(trajectories, max_trajectories=config.MAX_TRAJECTORIES_TO_PLOT, save_path=save_base)
         
         print("[info] Visualization complete!")

@@ -9,6 +9,7 @@ time-of-flight (TOF) behaviour of neutrons in an inertial confinement fusion
 Modules:
 --------
 - constants: Physical constants and configuration
+- config: Configurable simulation parameters
 - data_classes: Data structures (MeshGeometry, DetectorPlane, NeutronRecord)
 - stl_utils: STL file loading and processing
 - geometry: Geometry processing and ray-mesh intersection
@@ -22,6 +23,7 @@ Modules:
 """
 
 from .constants import *
+from . import config
 from .data_classes import MeshGeometry, DetectorPlane, NeutronRecord
 from .stl_utils import load_stl_mesh
 from .geometry import (
@@ -75,6 +77,8 @@ from .io_utils import (
 
 __version__ = "1.0.0"
 __all__ = [
+    # Config module
+    "config",
     # Constants
     "AVOGADRO_CONSTANT",
     "BARN_TO_M2",

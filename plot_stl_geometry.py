@@ -9,7 +9,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
-from icf_simulation import load_stl_mesh
+from icf_simulation import load_stl_mesh, config
 
 
 def _set_axes_equal(ax: plt.Axes) -> None:
@@ -79,60 +79,71 @@ def plot_meshes_mm(
     ax.set_title(title)
     ax.legend(loc="upper right")
     plt.tight_layout()
-    plt.savefig('Figures/stl_geometry_visualization.png', dpi=150)
-    print("\n✓ STL geometry plot displayed.")
+    save_path = Path(config.FIGURES_OUTPUT_DIR) / config.STL_GEOMETRY_FIGURE
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(str(save_path), dpi=config.QUICK_PLOT_DPI)
+    print(f"\n✓ STL geometry plot saved to {save_path}")
     plt.show()
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--stl",
-        type=Path,
-        default=Path("Target_ball_model.stl"),
-        help="Path to the primary STL file to visualise.",
-    )
-    parser.add_argument(
-        "--nTOF_without_scintillant",
+        "--stl-dir",
         type=Path,
         default=None,
-        help="Path to the nTOF_without_scintillant STL file to overlay (optional).",
+        help="Directory containing STL files (default: STL_model).",
+    )
+    parser.add_argument(
+        "--shell-only",
+        action="store_true",
+        help="Only plot the shell STL (skip channel overlay).",
     )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    if not args.stl.exists():
-        raise FileNotFoundError(f"Cannot find STL file at {args.stl}")
-
-    mesh_mm = load_mesh_mm(args.stl)
-    mean_r, max_r = mesh_distance_stats_mm(mesh_mm)
-    primary_info = (
-        f"{args.stl.name} | mean radius={mean_r:.2f} mm, "
-        f"max radius={max_r:.2f} mm"
-    )
-    print(primary_info)
-
-    meshes_to_plot: list[tuple[np.ndarray, str, tuple[float, float, float, float]]] = [
-        (mesh_mm, args.stl.name, (0.2, 0.5, 0.9, 0.35)),
+    
+    # Determine STL directory
+    base_dir = Path(__file__).resolve().parent
+    stl_dir = args.stl_dir if args.stl_dir else base_dir / config.STL_MODEL_DIR
+    
+    # Define STL files to load
+    stl_files_to_load = [
+        (config.SHELL_STL_FILE, "Shell", (0.2, 0.5, 0.9, 0.35)),
     ]
-    info_lines = [primary_info]
-
-    # 尝试自动查找 nTOF_without_scintillant.STL，但优先使用命令行参数
-    nTOF_without_scintillant_path = args.nTOF_without_scintillant if args.nTOF_without_scintillant else args.stl.with_name("nTOF_without_scintillant.STL")
-    if nTOF_without_scintillant_path and nTOF_without_scintillant_path.exists():
-        nTOF_without_scintillant_mesh_mm = load_mesh_mm(nTOF_without_scintillant_path)
-        nTOF_without_scintillant_mean, nTOF_without_scintillant_max = mesh_distance_stats_mm(nTOF_without_scintillant_mesh_mm)
-        nTOF_without_scintillant_info = (
-            f"{nTOF_without_scintillant_path.name} | mean radius={nTOF_without_scintillant_mean:.2f} mm, "
-            f"max radius={nTOF_without_scintillant_max:.2f} mm"
+    
+    if not args.shell_only:
+        stl_files_to_load.append(
+            (config.CHANNEL_STL_FILE, "Channel", (0.9, 0.35, 0.2, 0.28))
         )
-        print(nTOF_without_scintillant_info)
-        info_lines.append(nTOF_without_scintillant_info)
-        meshes_to_plot.append((nTOF_without_scintillant_mesh_mm, nTOF_without_scintillant_path.name, (0.9, 0.35, 0.2, 0.28)))
-    else:
-        print(f"nTOF_without_scintillant STL not found at {nTOF_without_scintillant_path}, skipping overlay.")
+    
+    # Load and process all STL files
+    meshes_to_plot = []
+    info_lines = []
+    
+    for filename, label, color in stl_files_to_load:
+        stl_path = stl_dir / filename
+        
+        if not stl_path.exists():
+            print(f"[warning] {label} STL not found at {stl_path}, skipping.")
+            continue
+        
+        # Load mesh
+        mesh_mm = load_mesh_mm(stl_path)
+        mean_r, max_r = mesh_distance_stats_mm(mesh_mm)
+        
+        # Print and store info
+        info = f"{filename} | mean radius={mean_r:.2f} mm, max radius={max_r:.2f} mm"
+        print(info)
+        info_lines.append(info)
+        
+        # Add to plot list
+        meshes_to_plot.append((mesh_mm, filename, color))
+    
+    if not meshes_to_plot:
+        raise FileNotFoundError(f"No STL files found in {stl_dir}")
 
     plot_meshes_mm(meshes_to_plot, "\n".join(info_lines))
 
