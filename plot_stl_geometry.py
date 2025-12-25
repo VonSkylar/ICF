@@ -9,7 +9,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
-from icf_neutron_simulation import load_stl_mesh
+from icf_simulation import load_stl_mesh
 
 
 def _set_axes_equal(ax: plt.Axes) -> None:

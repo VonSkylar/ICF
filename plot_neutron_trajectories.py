@@ -14,84 +14,11 @@ from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 from matplotlib.colors import Normalize
 from matplotlib.cm import ScalarMappable
 import csv
-import struct
-import os
 from pathlib import Path
 from collections import defaultdict
 
-
-def load_stl_mesh(file_path):
-    """Load a mesh from an STL file (simplified version).
-    
-    Parameters
-    ----------
-    file_path : str
-        Path to the STL file.
-        
-    Returns
-    -------
-    np.ndarray
-        Array of triangles, shape (n_facets, 3, 3).
-    """
-    if not os.path.isfile(file_path):
-        raise FileNotFoundError(f"STL file '{file_path}' does not exist")
-    
-    file_size = os.path.getsize(file_path)
-    
-    # Check if file is large enough to be binary STL
-    # Binary STL: 80 byte header + 4 byte count + n*(50 bytes per triangle)
-    if file_size >= 84:
-        with open(file_path, 'rb') as f:
-            header = f.read(80)
-            num_triangles = struct.unpack('<I', f.read(4))[0]
-            expected_size = 84 + num_triangles * 50
-            
-            # If size matches, assume binary
-            if abs(file_size - expected_size) < 100:  # Allow small tolerance
-                return load_stl_binary(file_path)
-    
-    # Otherwise try ASCII
-    return load_stl_ascii(file_path)
-
-
-def load_stl_binary(file_path):
-    """Load binary STL file."""
-    triangles = []
-    with open(file_path, 'rb') as f:
-        f.read(80)  # Skip header
-        num_triangles = struct.unpack('<I', f.read(4))[0]
-        
-        for _ in range(num_triangles):
-            # Read normal (we'll skip it)
-            normal = struct.unpack('<3f', f.read(12))
-            # Read 3 vertices
-            v1 = struct.unpack('<3f', f.read(12))
-            v2 = struct.unpack('<3f', f.read(12))
-            v3 = struct.unpack('<3f', f.read(12))
-            f.read(2)  # Skip attribute byte count
-            
-            # Store as numpy array [v1, v2, v3]
-            triangles.append(np.array([v1, v2, v3]))
-    
-    return np.array(triangles)
-
-
-def load_stl_ascii(file_path):
-    """Load ASCII STL file."""
-    triangles = []
-    with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-        vertices = []
-        for line in f:
-            line = line.strip()
-            if line.startswith('vertex'):
-                parts = line.split()
-                vertex = [float(parts[1]), float(parts[2]), float(parts[3])]
-                vertices.append(vertex)
-                if len(vertices) == 3:
-                    triangles.append(vertices)
-                    vertices = []
-    
-    return np.array(triangles)
+# Import from icf_simulation package
+from icf_simulation import load_stl_mesh
 
 
 def load_neutron_trajectory_data(csv_file):
@@ -217,6 +144,9 @@ def plot_neutron_trajectories_3d(trajectories, max_trajectories=100, save_path=N
             try:
                 print(f"[info] Loading aluminum shell from {shell_file.name}...")
                 shell_mesh = load_stl_mesh(str(shell_file))
+                # Handle new format: (n, 4, 3) with normals -> extract vertices only
+                if shell_mesh.shape[1] == 4:
+                    shell_mesh = shell_mesh[:, 1:, :]  # Shape becomes (n, 3, 3)
                 shell_mesh_scaled = shell_mesh * unit_scale
                 
                 num_triangles = len(shell_mesh_scaled)
@@ -238,6 +168,9 @@ def plot_neutron_trajectories_3d(trajectories, max_trajectories=100, save_path=N
             try:
                 print(f"[info] Loading polyethylene channel from {channel_file.name}...")
                 channel_mesh = load_stl_mesh(str(channel_file))
+                # Handle new format: (n, 4, 3) with normals -> extract vertices only
+                if channel_mesh.shape[1] == 4:
+                    channel_mesh = channel_mesh[:, 1:, :]  # Shape becomes (n, 3, 3)
                 channel_mesh_scaled = channel_mesh * unit_scale
                 
                 num_triangles = len(channel_mesh_scaled)
