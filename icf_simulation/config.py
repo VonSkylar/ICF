@@ -3,26 +3,36 @@ Configuration settings for ICF neutron simulation.
 
 This module contains all configurable parameters that were previously hardcoded.
 Users can modify these values to customize the simulation without changing the core code.
+
+Data files (cross-sections, STL models) are now bundled with the package.
+Use `icf_simulation.data_paths` to access them:
+
+    from icf_simulation.data_paths import get_cross_section_dir, get_stl_dir
 """
 
 from __future__ import annotations
 
+from pathlib import Path
+
 # =============================================================================
-# File and Directory Names
+# Package Data Paths (内置数据路径)
 # =============================================================================
 
-# Cross-section data files
-CROSS_SECTION_DIR = "cross_section_data"
+# Package root directory
+_PACKAGE_DIR = Path(__file__).resolve().parent
+
+# Cross-section data directory (包内)
+CROSS_SECTION_DIR = _PACKAGE_DIR / "data" / "cross_sections"
 AL_CROSS_SECTION_FILE = "Al.csv"
 H_CROSS_SECTION_FILE = "H.csv"
 C_CROSS_SECTION_FILE = "C.csv"
 
-# STL geometry files
-STL_MODEL_DIR = "STL_model"
+# STL geometry files directory (包内)
+STL_MODEL_DIR = _PACKAGE_DIR / "data" / "stl_models"
 SHELL_STL_FILE = "Target_ball_model.STL"
 CHANNEL_STL_FILE = "nTOF_without_scintillant.STL"
 
-# Output directories
+# Output directories (用户工作目录)
 DATA_OUTPUT_DIR = "Data"
 FIGURES_OUTPUT_DIR = "Figures"
 

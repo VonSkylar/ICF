@@ -1,0 +1,79 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "icf-simulation"
+version = "0.2.0"
+description = "ICF中子输运模拟包 - 惯性约束聚变诊断中子输运蒙特卡罗模拟"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.8"
+authors = [
+    {name = "ICF Simulation Team"}
+]
+keywords = ["ICF", "neutron", "Monte Carlo", "simulation", "physics"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Physics",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+
+dependencies = [
+    "numpy>=1.20.0",
+    "matplotlib>=3.3.0",
+    "numpy-stl>=2.16.0",
+    "tqdm>=4.60.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+    "black>=23.0.0",
+    "isort>=5.12.0",
+    "mypy>=1.0.0",
+]
+
+[project.scripts]
+icf-run = "scripts.run_simulation:main"
+icf-plot-trajectories = "scripts.plot_neutron_trajectories:main"
+icf-plot-geometry = "scripts.plot_stl_geometry:main"
+
+[project.urls]
+"Homepage" = "https://github.com/VonSkylar/ICF"
+"Bug Tracker" = "https://github.com/VonSkylar/ICF/issues"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["icf_simulation*"]
+
+[tool.setuptools.package-data]
+"icf_simulation.data.cross_sections" = ["*.csv"]
+"icf_simulation.data.stl_models" = ["*.stl", "*.STL"]
+
+[tool.black]
+line-length = 100
+target-version = ['py38', 'py39', 'py310', 'py311']
+
+[tool.isort]
+profile = "black"
+line_length = 100
+
+[tool.mypy]
+python_version = "3.8"
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-v --tb=short"

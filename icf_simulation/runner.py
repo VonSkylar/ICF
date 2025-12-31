@@ -1,70 +1,58 @@
-#!/usr/bin/env python
 """
-ICF Neutron Simulation - Main Runner Script
-============================================
+ICF Neutron Simulation Runner Module
 
-This script runs the complete ICF neutron simulation using modular components
-from the icf_simulation package.
-
-Usage:
-    python run_simulation.py
-
-The simulation will:
-1. Load cross-section data from CSV files
-2. Load STL geometry files
-3. Run the Monte Carlo simulation
-4. Export results to CSV files
-5. Generate visualization plots
+This module provides the main simulation runner function that can be called
+from scripts or imported directly.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple, List
 
 import numpy as np
 
-# Import from the modular package
-from icf_simulation import (
-    # Configuration
-    config,
-    # Constants
-    DEFAULT_SOURCE_CONE_HALF_ANGLE_DEG,
-    BARN_TO_M2,
-    # STL loading
-    load_stl_mesh,
-    # Geometry
+from . import config
+from .core.constants import DEFAULT_SOURCE_CONE_HALF_ANGLE_DEG, BARN_TO_M2
+from .core.stl_utils import load_stl_mesh
+from .core.geometry import (
     prepare_mesh_geometry,
     build_circular_detector_plane,
     mesh_distance_statistics,
-    # Cross-section data
+)
+from .core.cross_section import (
     load_mfp_data_from_csv,
     calculate_pe_macro_sigma,
     MFP_DATA_AL,
     MFP_DATA_PE,
-    # Simulation
-    run_simulation,
-    # Visualization
-    visualize_neutron_data,
-    visualize_detector_hits,
-    print_statistics,
-    # IO
-    export_neutron_records_to_csv,
-    export_neutron_trajectories_to_csv,
 )
+from .core.simulation import run_simulation
+from .plotting import visualize_neutron_data, visualize_detector_hits, print_statistics
+from .core.io_utils import export_neutron_records_to_csv, export_neutron_trajectories_to_csv
+from .core.data_classes import NeutronRecord
 
 
-def main():
-    """Main entry point for the ICF neutron simulation."""
+def load_cross_section_data() -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray], Optional[np.ndarray]]:
+    """Load cross-section data from package-bundled CSV files.
     
-    base_dir = Path(__file__).resolve().parent
-
-    # =========================================================================
-    # 1. Load Cross-Section Data
-    # =========================================================================
-    AL_CSV_FILE = base_dir / config.CROSS_SECTION_DIR / config.AL_CROSS_SECTION_FILE
-    H_CSV_FILE = base_dir / config.CROSS_SECTION_DIR / config.H_CROSS_SECTION_FILE
-    C_CSV_FILE = base_dir / config.CROSS_SECTION_DIR / config.C_CROSS_SECTION_FILE 
+    Cross-section data files are bundled with the package in
+    icf_simulation/data/cross_sections/
+        
+    Returns
+    -------
+    aluminium_mfp_data : np.ndarray
+        Aluminium macroscopic cross-section data.
+    channel_mfp_data : np.ndarray
+        Channel (PE) macroscopic cross-section data.
+    h_mfp_data : np.ndarray or None
+        Hydrogen macroscopic cross-section data (for nuclide sampling).
+    c_mfp_data : np.ndarray or None
+        Carbon macroscopic cross-section data (for nuclide sampling).
+    """
+    # 使用包内路径
+    AL_CSV_FILE = config.CROSS_SECTION_DIR / config.AL_CROSS_SECTION_FILE
+    H_CSV_FILE = config.CROSS_SECTION_DIR / config.H_CROSS_SECTION_FILE
+    C_CSV_FILE = config.CROSS_SECTION_DIR / config.C_CROSS_SECTION_FILE 
     
     # Load Aluminium cross-section data
     try:
@@ -128,11 +116,24 @@ def main():
     except Exception as e:
         print(f"[warning] Failed to calculate/load custom Polyethylene MFP data. Using default. Error: {e}")
         channel_mfp_data = MFP_DATA_PE
+    
+    return aluminium_mfp_data, channel_mfp_data, h_mfp_data, c_mfp_data
 
-    # =========================================================================
-    # 2. Load STL Geometry Files
-    # =========================================================================
-    stl_dir = base_dir / config.STL_MODEL_DIR
+
+def load_stl_geometry() -> Tuple[np.ndarray, np.ndarray]:
+    """Load STL geometry files from package-bundled location.
+    
+    STL model files are bundled with the package in
+    icf_simulation/data/stl_models/
+        
+    Returns
+    -------
+    shell_geometry : MeshGeometry
+        Prepared shell geometry.
+    channel_geometry : MeshGeometry
+        Prepared channel geometry.
+    """
+    stl_dir = config.STL_MODEL_DIR
     
     shell_stl_path = stl_dir / config.SHELL_STL_FILE
     channel_stl_path = stl_dir / config.CHANNEL_STL_FILE
@@ -155,25 +156,64 @@ def main():
     
     shell_geometry = prepare_mesh_geometry(mesh_scaled)
     channel_geometry = prepare_mesh_geometry(channel_scaled)
+    
     mean_radius, max_radius = mesh_distance_statistics(mesh_scaled)
+    print(f"[info] Shell thickness will be calculated from STL mesh geometry")
+    print(f"[info] STL vertex distances: mean={mean_radius:.4f} m, max={max_radius:.4f} m")
     
-    # =========================================================================
-    # 3. Configure Coordinate System and Detector
-    # =========================================================================
-    # Channel axis direction from config
+    return shell_geometry, channel_geometry
+
+
+def run_full_simulation(
+    output_dir: Optional[Path] = None,
+    n_neutrons: Optional[int] = None,
+    save_results: bool = True,
+    generate_plots: bool = True,
+) -> List[NeutronRecord]:
+    """Run the complete ICF neutron simulation.
+    
+    This is the main entry point for running simulations. It handles:
+    1. Loading cross-section data (from package-bundled files)
+    2. Loading STL geometry (from package-bundled files)
+    3. Running the Monte Carlo simulation
+    4. Exporting results
+    5. Generating visualization plots
+    
+    Parameters
+    ----------
+    output_dir : Path, optional
+        Directory for output files (Data/, Figures/). If None, uses current working directory.
+    n_neutrons : int, optional
+        Number of neutrons to simulate. If None, uses config default.
+    save_results : bool
+        Whether to save results to CSV files.
+    generate_plots : bool
+        Whether to generate visualization plots.
+        
+    Returns
+    -------
+    List[NeutronRecord]
+        List of neutron records from simulation.
+    """
+    if output_dir is None:
+        output_dir = Path.cwd()
+    else:
+        output_dir = Path(output_dir)
+    
+    if n_neutrons is None:
+        n_neutrons = config.DEFAULT_N_NEUTRONS
+    
+    # Load data (from package-bundled files)
+    aluminium_mfp_data, channel_mfp_data, h_mfp_data, c_mfp_data = load_cross_section_data()
+    shell_geometry, channel_geometry = load_stl_geometry()
+    
+    # Configure detector
     channel_axis = np.array(config.CHANNEL_AXIS)
-    
-    # Detector configuration from config
     detector_z_mm = config.DETECTOR_Z_MM
     detector_center_mm = np.array([0.0, 0.0, detector_z_mm])
     detector_radius_mm = config.DETECTOR_RADIUS_MM
     detector_plane = build_circular_detector_plane(detector_center_mm, detector_radius_mm, channel_axis)
-
-    # Shell thickness (calculated from STL mesh geometry)
-    shell_thickness = 0.0  # Will be calculated from Target_ball_model.STL geometry
-
-    print(f"[info] Shell thickness will be calculated from STL mesh geometry")
-    print(f"[info] STL vertex distances: mean={mean_radius:.4f} m, max={max_radius:.4f} m")
+    
     print("\n" + "="*70)
     print("COORDINATE SYSTEM CONFIGURATION")
     print("="*70)
@@ -185,21 +225,14 @@ def main():
     print(f"Detector radius: {detector_radius_mm:.1f} mm = {detector_plane.radius:.4f} m")
     print(f"Source cone half-angle: {DEFAULT_SOURCE_CONE_HALF_ANGLE_DEG}°")
     print("="*70 + "\n")
-
-    # =========================================================================
-    # 4. Run Simulation
-    # =========================================================================
-    # Simulation parameters from config (can be overridden)
-    n_neutrons = config.DEFAULT_N_NEUTRONS
-    aluminium_mass_ratio = config.AL_MASS_RATIO
-    channel_mass_ratio = config.PE_MASS_RATIO
-
+    
+    # Run simulation
     print(f"[info] Starting simulation with {n_neutrons} neutrons...")
     
     neutron_records = run_simulation(
         n_neutrons=n_neutrons,
-        shell_thickness=shell_thickness,
-        aluminium_mass_ratio=aluminium_mass_ratio,
+        shell_thickness=0.0,  # Calculated from STL geometry
+        aluminium_mass_ratio=config.AL_MASS_RATIO,
         aluminium_mfp_data=aluminium_mfp_data,
         detector_distance=detector_plane.plane_position,
         detector_side=1.0,
@@ -207,36 +240,57 @@ def main():
         shell_geometry=shell_geometry,
         channel_geometry=channel_geometry,
         channel_mfp_data=channel_mfp_data,
-        channel_mass_ratio=channel_mass_ratio,
+        channel_mass_ratio=config.PE_MASS_RATIO,
         source_cone_axis=channel_axis,
         detector_plane=detector_plane,
         h_mfp_data=h_mfp_data,
         c_mfp_data=c_mfp_data,
     )
-
-    # =========================================================================
-    # 5. Print Statistics and Export Results
-    # =========================================================================
+    
+    # Print statistics
     print_statistics(neutron_records, n_neutrons)
     
-    # Export neutron data to CSV
-    if neutron_records:
-        csv_filename = str(base_dir / config.DATA_OUTPUT_DIR / config.NEUTRON_DATA_CSV)
+    # Save results
+    if save_results and neutron_records:
+        csv_filename = str(output_dir / config.DATA_OUTPUT_DIR / config.NEUTRON_DATA_CSV)
         export_neutron_records_to_csv(neutron_records, filename=csv_filename)
         
-        # Export trajectory data
-        trajectory_filename = str(base_dir / config.DATA_OUTPUT_DIR / config.TRAJECTORY_DATA_CSV)
+        trajectory_filename = str(output_dir / config.DATA_OUTPUT_DIR / config.TRAJECTORY_DATA_CSV)
         export_neutron_trajectories_to_csv(neutron_records, filename=trajectory_filename)
     
-    # =========================================================================
-    # 6. Generate Visualizations
-    # =========================================================================
-    if neutron_records:
+    # Generate plots
+    if generate_plots and neutron_records:
         print("[info] Generating visualizations...")
-        save_base = str(base_dir / config.FIGURES_OUTPUT_DIR / config.NEUTRON_ANALYSIS_FIGURE_BASE)
+        save_base = str(output_dir / config.FIGURES_OUTPUT_DIR / config.NEUTRON_ANALYSIS_FIGURE_BASE)
         visualize_neutron_data(neutron_records, save_path=save_base)
         visualize_detector_hits(neutron_records, detector_plane, save_path=save_base)
         print("[info] Visualization complete!")
+    
+    return neutron_records
+
+
+def main():
+    """Command-line entry point."""
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="Run ICF neutron simulation")
+    parser.add_argument("-n", "--neutrons", type=int, default=None,
+                        help="Number of neutrons to simulate")
+    parser.add_argument("--no-save", action="store_true",
+                        help="Don't save results to CSV")
+    parser.add_argument("--no-plot", action="store_true",
+                        help="Don't generate visualization plots")
+    parser.add_argument("--output-dir", type=Path, default=None,
+                        help="Output directory for results and figures")
+    
+    args = parser.parse_args()
+    
+    run_full_simulation(
+        output_dir=args.output_dir,
+        n_neutrons=args.neutrons,
+        save_results=not args.no_save,
+        generate_plots=not args.no_plot,
+    )
 
 
 if __name__ == "__main__":

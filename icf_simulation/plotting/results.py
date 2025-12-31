@@ -1,5 +1,8 @@
 """
-Visualization utilities for neutron simulation results.
+Simulation results visualization.
+
+This module provides visualization functions for neutron simulation results,
+including energy distributions, detector hits, and statistical summaries.
 """
 
 from __future__ import annotations
@@ -10,7 +13,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle, Circle
 
-from .data_classes import NeutronRecord, DetectorPlane
+from ..core.data_classes import NeutronRecord, DetectorPlane
 
 
 def visualize_neutron_data(records: List[NeutronRecord], save_path: Optional[str] = None):
