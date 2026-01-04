@@ -90,6 +90,9 @@ from .transport import (
     propagate_through_mesh_material,
     simulate_in_aluminium,
     propagate_to_scintillator,
+    unified_transport,
+    MaterialType,
+    MaterialConfig,
 )
 
 __all__ = [
@@ -143,4 +146,7 @@ __all__ = [
     'propagate_through_mesh_material',
     'simulate_in_aluminium',
     'propagate_to_scintillator',
+    'unified_transport',
+    'MaterialType',
+    'MaterialConfig',
 ]

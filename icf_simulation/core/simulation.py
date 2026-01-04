@@ -12,7 +12,7 @@ from .constants import DEBUG, DEFAULT_SOURCE_CONE_HALF_ANGLE_DEG
 from .data_classes import MeshGeometry, DetectorPlane, NeutronRecord
 from .geometry import build_default_detector_plane
 from .sampling import sample_neutron_energy, sample_isotropic_direction, sample_direction_in_cone
-from .transport import simulate_in_aluminium, propagate_through_mesh_material, propagate_to_scintillator
+from .transport import simulate_in_aluminium, propagate_through_mesh_material, propagate_to_scintillator, unified_transport
 from .cross_section import MFP_DATA_PE, MFP_DATA_AL
 
 
@@ -34,6 +34,10 @@ def simulate_neutron_history(
     c_mfp_data: Optional[np.ndarray] = None,
 ) -> Tuple[str, Optional[NeutronRecord]]:
     """Simulate the complete history of a single neutron.
+    
+    This function now uses unified transport that handles overlapping geometries
+    (Al shell and PE channel) correctly by tracking which material is hit first
+    along the neutron's actual flight path.
 
     Returns
     -------
@@ -48,200 +52,121 @@ def simulate_neutron_history(
     else:
         d0 = sample_direction_in_cone(source_cone_axis, source_cone_half_angle_deg)
 
-    trajectory_points = []
-    trajectory_points.append((np.zeros(3), E0, "source"))
-
-    # 2. Transport through the aluminium shell
+    origin = np.zeros(3, dtype=float)
+    
+    # 2. Setup detector plane
     detector_plane = detector_plane or build_default_detector_plane(detector_distance, detector_side)
 
-    t_shell, E_after_shell, d_after_shell, pos_after_shell, shell_detector_crossing, shell_trajectory = simulate_in_aluminium(
-        d0,
-        E0,
-        shell_thickness,
-        aluminium_mfp_data,
-        aluminium_mass_ratio,
-        energy_cutoff_mev,
-        mesh_geometry=shell_geometry,
-        detector_plane=detector_plane,
-    )
-    
-    for pos, energy in shell_trajectory:
-        trajectory_points.append((pos, energy, "scatter"))
-    
-    if shell_detector_crossing is not None:
-        crossing_time, crossing_point, crossing_energy = shell_detector_crossing
-        trajectory_points.append((pos_after_shell.copy(), E_after_shell, "shell_exit"))
-        trajectory_points.append((crossing_point.copy(), crossing_energy, "detector_hit"))
-        
-        record = NeutronRecord(
-            initial_energy=E0,
-            final_energy=crossing_energy,
-            tof=crossing_time,
-            exit_position=pos_after_shell.copy(),
-            detector_hit_position=crossing_point.copy(),
-            reached_detector=True,
-            energy_after_shell=crossing_energy,
-            energy_after_channel=crossing_energy,
-            status="success",
-            final_position=crossing_point.copy(),
-            final_direction=d_after_shell.copy(),
-            trajectory_points=trajectory_points
-        )
-        return ("success", record)
-    
-    trajectory_points.append((pos_after_shell.copy(), E_after_shell, "shell_exit"))
-    
-    if E_after_shell <= energy_cutoff_mev:
-        record = NeutronRecord(
-            initial_energy=E0,
-            final_energy=E_after_shell,
-            tof=t_shell,
-            exit_position=pos_after_shell.copy(),
-            detector_hit_position=None,
-            reached_detector=False,
-            energy_after_shell=E_after_shell,
-            energy_after_channel=0.0,
-            status="lost_in_shell",
-            final_position=pos_after_shell.copy(),
-            final_direction=d_after_shell.copy(),
-            trajectory_points=trajectory_points
-        )
-        return ("lost_in_shell", record)
-
-    # 3. Interaction with the polyethylene channel
-    result = propagate_through_mesh_material(
-        pos_after_shell,
-        d_after_shell,
-        E_after_shell,
-        channel_geometry,
-        channel_mfp_data,
-        channel_mass_ratio,
-        energy_cutoff_mev,
+    # 3. Use unified transport through all materials
+    (cumulative_time, final_energy, final_pos, final_dir, 
+     detector_crossing, trajectory_points) = unified_transport(
+        position=origin,
+        direction=d0,
+        energy_mev=E0,
+        shell_geometry=shell_geometry,
+        channel_geometry=channel_geometry,
+        aluminium_mfp_data=aluminium_mfp_data,
+        channel_mfp_data=channel_mfp_data,
+        aluminium_mass_ratio=aluminium_mass_ratio,
+        channel_mass_ratio=channel_mass_ratio,
+        energy_cutoff_mev=energy_cutoff_mev,
         detector_plane=detector_plane,
         h_mfp_data=h_mfp_data,
         c_mfp_data=c_mfp_data,
     )
     
-    t_channel, E_after_channel, pos_after_channel, d_after_channel, detector_crossing, channel_trajectory = result
+    # 4. Determine outcome and create record
+    # Convert trajectory format for NeutronRecord
+    formatted_trajectory = [(pos, energy, event) for pos, energy, event in trajectory_points]
     
-    for pos, energy in channel_trajectory:
-        trajectory_points.append((pos, energy, "scatter"))
+    # Count scattering events in each material
+    shell_scatters = sum(1 for _, _, e in trajectory_points if "scatter_Al" in e)
+    channel_scatters = sum(1 for _, _, e in trajectory_points if "scatter_PE" in e)
     
-    trajectory_points.append((pos_after_channel.copy(), E_after_channel, "channel_exit"))
+    # Find energy after shell and after channel based on trajectory
+    # Also find the first exit position from aluminum shell
+    energy_after_shell = E0
+    energy_after_channel = E0
+    first_shell_exit_pos = None
     
-    if E_after_channel <= energy_cutoff_mev:
-        record = NeutronRecord(
-            initial_energy=E0,
-            final_energy=E_after_channel,
-            tof=t_shell + t_channel,
-            exit_position=pos_after_shell.copy(),
-            detector_hit_position=None,
-            reached_detector=False,
-            energy_after_shell=E_after_shell,
-            energy_after_channel=E_after_channel,
-            status="lost_in_channel",
-            final_position=pos_after_channel.copy(),
-            final_direction=d_after_channel.copy(),
-            trajectory_points=trajectory_points
-        )
-        return ("lost_in_channel", record)
+    for pos, energy, event in trajectory_points:
+        if "exit_Al" in event:
+            if first_shell_exit_pos is None:
+                first_shell_exit_pos = pos.copy()
+            energy_after_shell = energy
+        if "enter_PE" in event and first_shell_exit_pos is None:
+            # If entering PE without explicit Al exit, use this position
+            first_shell_exit_pos = pos.copy()
+            energy_after_shell = energy
+        if "exit_PE" in event or "detector" in event or "escape" in event:
+            energy_after_channel = energy
+    
+    # If no shell exit was found, use final position
+    if first_shell_exit_pos is None:
+        first_shell_exit_pos = final_pos.copy()
     
     if detector_crossing is not None:
         crossing_time, crossing_point, crossing_energy = detector_crossing
-        total_tof = t_shell + crossing_time
-        
-        trajectory_points.append((crossing_point.copy(), crossing_energy, "detector_hit"))
         
         record = NeutronRecord(
             initial_energy=E0,
             final_energy=crossing_energy,
-            tof=total_tof,
-            exit_position=pos_after_shell.copy(),
+            tof=crossing_time,
+            exit_position=first_shell_exit_pos,
             detector_hit_position=crossing_point.copy(),
             reached_detector=True,
-            energy_after_shell=E_after_shell,
+            energy_after_shell=energy_after_shell,
             energy_after_channel=crossing_energy,
             status="success",
             final_position=crossing_point.copy(),
-            final_direction=d_after_channel.copy(),
-            trajectory_points=trajectory_points
+            final_direction=final_dir.copy(),
+            trajectory_points=formatted_trajectory
         )
         return ("success", record)
-
-    # 4. Check final position relative to detector plane
-    pos_proj = np.dot(detector_plane.axis, pos_after_channel - detector_plane.center)
     
-    if pos_proj > 0:
-        extension_distance = 1.0
-        extended_point = pos_after_channel + d_after_channel * extension_distance
-        trajectory_points.append((extended_point.copy(), E_after_channel, "miss_extended"))
+    if final_energy <= energy_cutoff_mev:
+        # Lost due to energy cutoff
+        # Determine where it was lost based on last trajectory event
+        last_event = trajectory_points[-1][2] if trajectory_points else "unknown"
+        if "Al" in last_event:
+            status = "lost_in_shell"
+        elif "PE" in last_event:
+            status = "lost_in_channel"
+        else:
+            status = "lost_low_energy"
         
         record = NeutronRecord(
             initial_energy=E0,
-            final_energy=E_after_channel,
-            tof=t_shell + t_channel,
-            exit_position=pos_after_shell.copy(),
+            final_energy=final_energy,
+            tof=cumulative_time,
+            exit_position=first_shell_exit_pos,
             detector_hit_position=None,
             reached_detector=False,
-            energy_after_shell=E_after_shell,
-            energy_after_channel=E_after_channel,
-            status="missed_detector",
-            final_position=pos_after_channel.copy(),
-            final_direction=d_after_channel.copy(),
-            trajectory_points=trajectory_points
+            energy_after_shell=energy_after_shell,
+            energy_after_channel=energy_after_channel,
+            status=status,
+            final_position=final_pos.copy(),
+            final_direction=final_dir.copy(),
+            trajectory_points=formatted_trajectory
         )
-        return ("missed_detector", record)
-    else:
-        flight_time, hit_point = propagate_to_scintillator(
-            pos_after_channel,
-            d_after_channel,
-            E_after_channel,
-            detector_plane,
-            energy_cutoff_mev=energy_cutoff_mev,
-        )
-        
-        if flight_time is None:
-            extension_distance = 1.5
-            extended_point = pos_after_channel + d_after_channel * extension_distance
-            trajectory_points.append((extended_point.copy(), E_after_channel, "miss_extended"))
-            
-            record = NeutronRecord(
-                initial_energy=E0,
-                final_energy=E_after_channel,
-                tof=t_shell + t_channel,
-                exit_position=pos_after_shell.copy(),
-                detector_hit_position=None,
-                reached_detector=False,
-                energy_after_shell=E_after_shell,
-                energy_after_channel=E_after_channel,
-                status="missed_detector",
-                final_position=pos_after_channel.copy(),
-                final_direction=d_after_channel.copy(),
-                trajectory_points=trajectory_points
-            )
-            return ("missed_detector", record)
-
-        total_tof = t_shell + t_channel + flight_time
-        
-        if hit_point is not None:
-            trajectory_points.append((hit_point.copy(), E_after_channel, "detector_hit"))
-        
-        record = NeutronRecord(
-            initial_energy=E0,
-            final_energy=E_after_channel,
-            tof=total_tof,
-            exit_position=pos_after_shell.copy(),
-            detector_hit_position=hit_point.copy() if hit_point is not None else None,
-            reached_detector=True,
-            energy_after_shell=E_after_shell,
-            energy_after_channel=E_after_channel,
-            status="success",
-            final_position=hit_point.copy() if hit_point is not None else None,
-            final_direction=d_after_channel.copy(),
-            trajectory_points=trajectory_points
-        )
-        
-        return ("success", record)
+        return (status, record)
+    
+    # Missed detector
+    record = NeutronRecord(
+        initial_energy=E0,
+        final_energy=final_energy,
+        tof=cumulative_time,
+        exit_position=first_shell_exit_pos,
+        detector_hit_position=None,
+        reached_detector=False,
+        energy_after_shell=energy_after_shell,
+        energy_after_channel=energy_after_channel,
+        status="missed_detector",
+        final_position=final_pos.copy(),
+        final_direction=final_dir.copy(),
+        trajectory_points=formatted_trajectory
+    )
+    return ("missed_detector", record)
 
 
 def run_simulation(
