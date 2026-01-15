@@ -8,7 +8,9 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 
-from .constants import DEBUG, DEFAULT_SOURCE_CONE_HALF_ANGLE_DEG
+from .constants import DEBUG
+from .. import config
+from ..config import DEFAULT_SOURCE_CONE_HALF_ANGLE_DEG
 from .data_classes import MeshGeometry, DetectorPlane, NeutronRecord
 from .geometry import build_default_detector_plane
 from .sampling import sample_neutron_energy, sample_isotropic_direction, sample_direction_in_cone

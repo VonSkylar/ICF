@@ -66,10 +66,12 @@ from .core.constants import (
     BARN_TO_M2,
     NEUTRON_MASS_KG,
     DEBUG,
-    DEFAULT_SOURCE_CONE_HALF_ANGLE_DEG,
     reset_geometry_leak_stats,
     print_geometry_leak_stats,
 )
+
+# 用户可配置参数 (从 config 导入)
+from .config import DEFAULT_SOURCE_CONE_HALF_ANGLE_DEG
 
 # 数据类
 from .core.data_classes import (

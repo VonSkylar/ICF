@@ -34,94 +34,55 @@ def visualize_neutron_data(records: List[NeutronRecord], save_path: Optional[str
     final_energies = np.array([r.final_energy for r in records])
     tofs = np.array([r.tof for r in records])
     energy_loss = initial_energies - final_energies
+    retention = final_energies / initial_energies
     
-    fig = plt.figure(figsize=(16, 12))
+    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
     
-    # 1. Energy histogram
-    ax1 = fig.add_subplot(3, 3, 1)
+    # 1. Energy histogram (top-left)
+    ax1 = axes[0, 0]
     ax1.hist(initial_energies, bins=50, alpha=0.7, label='Initial Energy', color='blue')
     ax1.hist(final_energies, bins=50, alpha=0.7, label='Final Energy', color='red')
     ax1.set_xlabel('Energy (MeV)')
     ax1.set_ylabel('Count')
-    ax1.set_title('All Neutron Energy Distribution')
+    ax1.set_title('Energy Distribution')
     ax1.legend()
     ax1.grid(True, alpha=0.3)
     
-    # 2. Energy loss
-    ax2 = fig.add_subplot(3, 3, 2)
-    ax2.hist(energy_loss, bins=50, color='green', alpha=0.7)
-    ax2.set_xlabel('Energy Loss (MeV)')
+    # 2. Energy retention distribution (top-right)
+    ax2 = axes[0, 1]
+    ax2.hist(retention, bins=50, color='teal', alpha=0.7, )
+    ax2.axvline(np.mean(retention), color='red', linestyle='--', linewidth=2, 
+                label=f'Mean: {np.mean(retention):.3f}')
+    ax2.axvline(np.median(retention), color='blue', linestyle=':', linewidth=2,
+                label=f'Median: {np.median(retention):.3f}')
+    ax2.set_xlabel('Energy Retention (Final/Initial)')
     ax2.set_ylabel('Count')
-    ax2.set_title('Energy Loss Distribution')
+    ax2.set_title('Energy Retention Distribution')
+    ax2.legend()
     ax2.grid(True, alpha=0.3)
     
-    # 3. TOF histogram
-    ax3 = fig.add_subplot(3, 3, 3)
-    ax3.hist(tofs * 1e9, bins=50, color='purple', alpha=0.7)
+    # 3. TOF vs Energy (bottom-left)
+    ax3 = axes[1, 0]
+    ax3.scatter(tofs * 1e9, initial_energies, alpha=0.5, s=30, label='Initial Energy', color='blue')
+    ax3.scatter(tofs * 1e9, final_energies, alpha=0.5, s=30, label='Final Energy', color='red')
     ax3.set_xlabel('Time of Flight (ns)')
-    ax3.set_ylabel('Count')
-    ax3.set_title('TOF Distribution')
+    ax3.set_ylabel('Energy (MeV)')
+    ax3.set_title('TOF vs Energy')
+    ax3.legend()
     ax3.grid(True, alpha=0.3)
     
-    # 4. Initial vs Final Energy scatter
-    ax4 = fig.add_subplot(3, 3, 4)
-    ax4.scatter(initial_energies, final_energies, alpha=0.5, s=30, c=tofs*1e9, cmap='viridis')
-    ax4.plot([0, 3], [0, 3], 'r--', alpha=0.5, label='No energy loss')
-    ax4.set_xlabel('Initial Energy (MeV)')
-    ax4.set_ylabel('Final Energy (MeV)')
-    ax4.set_title('Initial vs Final Energy')
+    # 4. TOF histogram (bottom-right)
+    ax4 = axes[1, 1]
+    ax4.hist(tofs * 1e9, bins=50, color='purple', alpha=0.7)
+    ax4.axvline(np.mean(tofs)*1e9, color='red', linestyle='--', linewidth=2,
+                label=f'Mean: {np.mean(tofs)*1e9:.2f} ns')
+    ax4.axvline(np.median(tofs)*1e9, color='blue', linestyle=':', linewidth=2,
+                label=f'Median: {np.median(tofs)*1e9:.2f} ns')
+    ax4.set_xlabel('Time of Flight (ns)')
+    ax4.set_ylabel('Count')
+    ax4.set_title('TOF Distribution')
     ax4.legend()
     ax4.grid(True, alpha=0.3)
-    cbar = plt.colorbar(ax4.collections[0], ax=ax4)
-    cbar.set_label('TOF (ns)')
-    
-    # 5. Energy loss distribution
-    ax5 = fig.add_subplot(3, 3, 5)
-    ax5.hist(energy_loss, bins=50, color='red', alpha=0.7, edgecolor='black')
-    ax5.axvline(np.mean(energy_loss), color='blue', linestyle='--', linewidth=2, 
-                label=f'Mean: {np.mean(energy_loss):.2f} MeV')
-    ax5.set_xlabel('Energy Loss (MeV)')
-    ax5.set_ylabel('Count')
-    ax5.set_title('Energy Loss Distribution')
-    ax5.legend()
-    ax5.grid(True, alpha=0.3)
-    
-    # 6. Initial Energy vs Energy Loss
-    ax6 = fig.add_subplot(3, 3, 6)
-    scatter = ax6.scatter(initial_energies, energy_loss, c=tofs*1e9, cmap='coolwarm', s=30, alpha=0.6)
-    ax6.set_xlabel('Initial Energy (MeV)')
-    ax6.set_ylabel('Energy Loss (MeV)')
-    ax6.set_title('Initial Energy vs Energy Loss')
-    ax6.grid(True, alpha=0.3)
-    plt.colorbar(scatter, ax=ax6, label='TOF (ns)')
-    
-    # 7. Energy vs TOF
-    ax7 = fig.add_subplot(3, 3, 7)
-    ax7.scatter(initial_energies, tofs * 1e9, alpha=0.5, s=20, label='Initial')
-    ax7.scatter(final_energies, tofs * 1e9, alpha=0.5, s=20, label='Final')
-    ax7.set_xlabel('Energy (MeV)')
-    ax7.set_ylabel('TOF (ns)')
-    ax7.set_title('Energy vs Time of Flight')
-    ax7.legend()
-    ax7.grid(True, alpha=0.3)
-    
-    # 8. Energy Retention vs TOF
-    ax8 = fig.add_subplot(3, 3, 8)
-    retention = final_energies / initial_energies
-    scatter = ax8.scatter(tofs * 1e9, retention, c=initial_energies, cmap='viridis', s=30, alpha=0.6)
-    ax8.set_xlabel('TOF (ns)')
-    ax8.set_ylabel('Energy Retention Fraction')
-    ax8.set_title('Energy Retention vs TOF')
-    ax8.grid(True, alpha=0.3)
-    plt.colorbar(scatter, ax=ax8, label='Initial Energy (MeV)')
-    
-    # 9. Energy retention
-    ax9 = fig.add_subplot(3, 3, 9)
-    ax9.hist(retention, bins=50, color='brown', alpha=0.7)
-    ax9.set_xlabel('Energy Retention Fraction')
-    ax9.set_ylabel('Count')
-    ax9.set_title('Energy Retention (Final/Initial)')
-    ax9.grid(True, alpha=0.3)
     
     plt.tight_layout()
     

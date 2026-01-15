@@ -109,9 +109,9 @@ TRAJECTORY_3D_FIGSIZE = (11, 16)
 TRAJECTORY_2D_FIGSIZE = (16, 10)
 
 # Mesh visualization settings
-STL_SHELL_ALPHA = 0.12  # Transparency for shell geometry
+STL_SHELL_ALPHA = 0.25# Transparency for shell geometry
 STL_SHELL_COLOR = "lightgray"
-STL_CHANNEL_ALPHA = 0.2  # Transparency for channel geometry
+STL_CHANNEL_ALPHA = 0.4# Transparency for channel geometry
 STL_CHANNEL_COLOR = "lightblue"
 DETECTOR_COLOR = "red"
 DETECTOR_ALPHA = 0.25

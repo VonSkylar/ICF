@@ -20,7 +20,6 @@ from .constants import (
     BARN_TO_M2,
     NEUTRON_MASS_KG,
     DEBUG,
-    DEFAULT_SOURCE_CONE_HALF_ANGLE_DEG,
     reset_geometry_leak_stats,
     print_geometry_leak_stats,
 )
@@ -101,7 +100,6 @@ __all__ = [
     'BARN_TO_M2',
     'NEUTRON_MASS_KG',
     'DEBUG',
-    'DEFAULT_SOURCE_CONE_HALF_ANGLE_DEG',
     'reset_geometry_leak_stats',
     'print_geometry_leak_stats',
     # 数据类

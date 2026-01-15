@@ -28,6 +28,7 @@ classifiers = [
 
 dependencies = [
     "numpy>=1.20.0",
+    "scipy>=1.7.0",
     "matplotlib>=3.3.0",
     "numpy-stl>=2.16.0",
     "tqdm>=4.60.0",
@@ -43,9 +44,7 @@ dev = [
 ]
 
 [project.scripts]
-icf-run = "scripts.run_simulation:main"
-icf-plot-trajectories = "scripts.plot_neutron_trajectories:main"
-icf-plot-geometry = "scripts.plot_stl_geometry:main"
+icf-run = "icf_simulation.runner:main"
 
 [project.urls]
 "Homepage" = "https://github.com/VonSkylar/ICF"

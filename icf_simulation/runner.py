@@ -13,7 +13,8 @@ from typing import Optional, Tuple, List
 import numpy as np
 
 from . import config
-from .core.constants import DEFAULT_SOURCE_CONE_HALF_ANGLE_DEG, BARN_TO_M2
+from .config import DEFAULT_SOURCE_CONE_HALF_ANGLE_DEG
+from .core.constants import AVOGADRO_CONSTANT, BARN_TO_M2
 from .core.stl_utils import load_stl_mesh
 from .core.geometry import (
     prepare_mesh_geometry,
@@ -57,13 +58,12 @@ def load_cross_section_data() -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarr
     # Load Aluminium cross-section data
     try:
         if AL_CSV_FILE.exists():
-            from scipy.constants import Avogadro
             al_micro_data = load_mfp_data_from_csv(str(AL_CSV_FILE))
             
             rho_Al_g_cm3 = config.AL_DENSITY_G_CM3
             M_Al = config.AL_MOLAR_MASS
             rho_Al_g_m3 = rho_Al_g_cm3 * 1e6  # g/m³
-            N_Al_m3 = (rho_Al_g_m3 / M_Al) * Avogadro  # atoms/m³
+            N_Al_m3 = (rho_Al_g_m3 / M_Al) * AVOGADRO_CONSTANT  # atoms/m³
             
             aluminium_mfp_data = np.column_stack([
                 al_micro_data[:, 0],  # Energy (MeV)
@@ -84,8 +84,6 @@ def load_cross_section_data() -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarr
     
     try:
         if H_CSV_FILE.exists() and C_CSV_FILE.exists():
-            from scipy.constants import Avogadro
-            
             h_micro_data = load_mfp_data_from_csv(str(H_CSV_FILE))
             c_micro_data = load_mfp_data_from_csv(str(C_CSV_FILE))
             
@@ -94,8 +92,8 @@ def load_cross_section_data() -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarr
             # Calculate separate macroscopic cross-sections for H and C (for nuclide sampling)
             rho_PE = config.PE_DENSITY_G_CM3 * 1e6  # Convert g/cm³ to g/m³
             M_C2H4 = config.PE_MOLAR_MASS
-            N_C = (config.C_ATOMS_PER_MOLECULE / M_C2H4) * rho_PE * Avogadro  # number density of C (m⁻³)
-            N_H = (config.H_ATOMS_PER_MOLECULE / M_C2H4) * rho_PE * Avogadro  # number density of H (m⁻³)
+            N_C = (config.C_ATOMS_PER_MOLECULE / M_C2H4) * rho_PE * AVOGADRO_CONSTANT  # number density of C (m⁻³)
+            N_H = (config.H_ATOMS_PER_MOLECULE / M_C2H4) * rho_PE * AVOGADRO_CONSTANT  # number density of H (m⁻³)
             
             h_mfp_data = np.column_stack([
                 h_micro_data[:, 0],  # Energy (MeV)

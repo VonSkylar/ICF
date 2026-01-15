@@ -126,9 +126,6 @@ def plot_trajectories_3d(
     >>> trajectories = load_trajectory_data('Data/neutron_trajectories.csv')
     >>> plot_trajectories_3d(trajectories, max_trajectories=50, save_path='Figures/traj')
     """
-    fig = plt.figure(figsize=figsize)
-    ax = fig.add_subplot(111, projection='3d')
-    
     # Select trajectories to plot
     neutron_ids = sorted(trajectories.keys())[:max_trajectories]
     
@@ -142,7 +139,6 @@ def plot_trajectories_3d(
     
     if not all_energies:
         print("[warning] No trajectory data to plot.")
-        plt.close(fig)
         return None
     
     energy_min = min(all_energies)
@@ -150,10 +146,58 @@ def plot_trajectories_3d(
     norm = Normalize(vmin=energy_min, vmax=energy_max)
     cmap = plt.cm.plasma
     
+    # Helper function to set up common axis properties
+    def _setup_axis(ax):
+        # Turn off grid and background panes
+        ax.grid(False)
+        ax.xaxis.pane.fill = False
+        ax.yaxis.pane.fill = False
+        ax.zaxis.pane.fill = False
+        ax.xaxis.pane.set_edgecolor('none')
+        ax.yaxis.pane.set_edgecolor('none')
+        ax.zaxis.pane.set_edgecolor('none')
+        # Turn off axis lines and ticks
+        ax.set_axis_off()
+        
+        ax.set_xlim(-1, 1)
+        ax.set_ylim(-1, 1)
+        ax.set_zlim(-1, 3)
+        ax.set_box_aspect([1, 1, 2])
+        ax.view_init(elev=20, azim=45)
+    
+    # ========== First figure: Geometry only ==========
+    fig1 = plt.figure(figsize=figsize)
+    ax1 = fig1.add_subplot(111, projection='3d')
+    
     # Load and display geometry
     if show_geometry and geometry_source != 'none':
-        _add_geometry_to_plot(ax, geometry_source, simple_geometry_type, stl_dir)
-        _add_detector_plane(ax)
+        _add_geometry_to_plot(ax1, geometry_source, simple_geometry_type, stl_dir)
+        _add_detector_plane(ax1)
+    
+    # Mark target center with red dot
+    ax1.scatter(0, 0, 0, c='red', marker='o', s=100, alpha=1.0, edgecolors='darkred', linewidths=2, zorder=100)
+    
+    _setup_axis(ax1)
+    plt.tight_layout()
+    
+    if save_path:
+        output_path = Path(save_path).parent
+        output_path.mkdir(parents=True, exist_ok=True)
+        plt.savefig(f'{save_path}_geometry_only.png', dpi=dpi, bbox_inches='tight', transparent=True)
+        print(f"[info] Saved geometry-only plot to {save_path}_geometry_only.png")
+    plt.close(fig1)
+    
+    # ========== Second figure: Geometry + Trajectories ==========
+    fig2 = plt.figure(figsize=figsize)
+    ax2 = fig2.add_subplot(111, projection='3d')
+    
+    # Load and display geometry
+    if show_geometry and geometry_source != 'none':
+        _add_geometry_to_plot(ax2, geometry_source, simple_geometry_type, stl_dir)
+        _add_detector_plane(ax2)
+    
+    # Mark target center with red dot
+    ax2.scatter(0, 0, 0, c='red', marker='o', s=100, alpha=1.0, edgecolors='darkred', linewidths=2, zorder=100)
     
     # Plot trajectories
     for neutron_id in neutron_ids:
@@ -172,7 +216,7 @@ def plot_trajectories_3d(
             mid_energy = (energies[i] + energies[i + 1]) / 2
             color = cmap(norm(mid_energy))
             
-            ax.plot([start_pos[0], end_pos[0]],
+            ax2.plot([start_pos[0], end_pos[0]],
                    [start_pos[1], end_pos[1]],
                    [start_pos[2], end_pos[2]],
                    color=color, linewidth=1.0, alpha=0.6)
@@ -180,21 +224,21 @@ def plot_trajectories_3d(
         # Mark special points
         for point in traj:
             if point['event_type'] == 'source':
-                ax.scatter(*point['position'], c='green', marker='o', s=30, alpha=0.8)
+                ax2.scatter(*point['position'], c='green', marker='o', s=30, alpha=0.8)
             elif point['event_type'] == 'detector_hit':
-                ax.scatter(*point['position'], c='red', marker='*', s=50, alpha=0.8)
+                ax2.scatter(*point['position'], c='red', marker='*', s=50, alpha=0.8)
     
     # Add colorbar
     sm = ScalarMappable(cmap=cmap, norm=norm)
     sm.set_array([])
-    cbar = plt.colorbar(sm, ax=ax, pad=0, shrink=0.5, aspect=30)
+    cbar = plt.colorbar(sm, ax=ax2, pad=0, shrink=0.5, aspect=30)
     cbar.set_label('Neutron Energy (MeV)', fontsize=12)
     
     # Labels and title
-    ax.set_xlabel('X Position (m)', fontsize=12)
-    ax.set_ylabel('Y Position (m)', fontsize=12)
-    ax.set_zlabel('Z Position (m)', fontsize=12)
-    ax.set_title(f'Neutron Trajectories (n={len(neutron_ids)})', fontsize=14, fontweight='bold')
+    # ax2.set_xlabel('X Position (m)', fontsize=12)
+    # ax2.set_ylabel('Y Position (m)', fontsize=12)
+    # ax2.set_zlabel('Z Position (m)', fontsize=12)
+    # ax2.set_title(f'Neutron Trajectories (n={len(neutron_ids)})', fontsize=14, fontweight='bold')
     
     # Add legend
     legend_elements = [
@@ -210,35 +254,27 @@ def plot_trajectories_3d(
     
     if show_geometry:
         legend_elements.extend([
-            Line2D([0], [0], color='gray', linewidth=4, alpha=0.3, label='Aluminum Shell'),
-            Line2D([0], [0], color='cyan', linewidth=4, alpha=0.3, label='Polyethylene Channel'),
-            Line2D([0], [0], color='red', linewidth=2, label='Detector Plane')
+            Line2D([0], [0], color='gray', linewidth=4, alpha=0.6, label='Aluminum Shell'),
+            Line2D([0], [0], color='cyan', linewidth=4, alpha=0.6, label='Polyethylene Channel'),
+            Line2D([0], [0], color='red', linewidth=2, alpha=0.4, label='Detector Plane')
         ])
     
-    ax.legend(handles=legend_elements, loc='upper left', bbox_to_anchor=(-0.1, 1.0),
-              fontsize=9, ncol=1, frameon=True)
+    # ax2.legend(handles=legend_elements, loc='upper left', bbox_to_anchor=(-0.1, 1.0),
+    #           fontsize=9, ncol=1, frameon=True)
     
-    # Set axis limits and aspect
-    ax.set_xlim(-1, 1)
-    ax.set_ylim(-1, 1)
-    ax.set_zlim(-1, 3)
-    ax.set_box_aspect([1, 1, 2])
-    ax.view_init(elev=20, azim=45)
-    
+    _setup_axis(ax2)
     plt.tight_layout()
     
     if save_path:
-        output_path = Path(save_path).parent
-        output_path.mkdir(parents=True, exist_ok=True)
-        plt.savefig(f'{save_path}_3d.png', dpi=dpi, bbox_inches='tight')
+        plt.savefig(f'{save_path}_3d.png', dpi=dpi, bbox_inches='tight', transparent=True)
         print(f"[info] Saved 3D trajectory plot to {save_path}_3d.png")
-        plt.close(fig)
+        plt.close(fig2)
         return None
     elif show:
         plt.show()
         return None
     else:
-        return fig
+        return fig2
 
 
 def plot_trajectories_2d(

@@ -1,11 +1,16 @@
 """
 Physical constants and simulation configuration.
+
+NOTE: 物理常数使用 scipy.constants 的 CODATA 推荐值
+用户可配置的参数放在 config.py 中
 """
 
-# Physical constants
-AVOGADRO_CONSTANT = 6.02214076e23  # mol⁻¹
+from scipy.constants import Avogadro, physical_constants
+
+# Physical constants (from scipy.constants for accuracy)
+AVOGADRO_CONSTANT = Avogadro  # mol⁻¹ (6.02214076e23)
 BARN_TO_M2 = 1.0e-28  # 1 barn = 10⁻²⁸ m²
-NEUTRON_MASS_KG = 1.67492749804e-27  # kg
+NEUTRON_MASS_KG = physical_constants['neutron mass'][0]  # kg (1.67492749804e-27)
 
 # Debug flag
 DEBUG = False
@@ -17,10 +22,6 @@ GEOMETRY_LEAK_STATS = {
     'retry_failures': 0,
     'outside_detections': 0,
 }
-
-# Default source cone half-angle (degrees)
-DEFAULT_SOURCE_CONE_HALF_ANGLE_DEG = 10
-
 
 def reset_geometry_leak_stats():
     """Reset geometry leak statistics counters."""

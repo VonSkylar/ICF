@@ -14,7 +14,7 @@ pip install -e ".[dev]"
 
 ## 包结构
 
-```
+```text
 icf_simulation/
 ├── __init__.py           # 主包入口
 ├── config.py             # 配置参数
