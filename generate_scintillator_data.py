@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 
 # 设置模拟的中子数量
-num_neutrons = 1000
+num_neutrons = 32800
 
 # 1. 设定停止位置 (z = 0, x^2 + y^2 <= 0.1^2)
 # 在半径为 0.1m 的圆内均匀采样
@@ -32,7 +32,7 @@ dir_z = dz / norm
 
 # 3. 能量分布：以 2.45MeV 为中心，0.1MeV 为半宽 (FWHM) 的高斯分布
 # FWHM = 2 * sqrt(2 * ln(2)) * sigma ≈ 2.355 * sigma
-fwhm = 0.1
+fwhm = 184.47e-3  # 0.05834 MeV
 sigma = fwhm / (2 * np.sqrt(2 * np.log(2)))
 energy_mev = np.random.normal(2.45, sigma, num_neutrons)
 
@@ -58,6 +58,6 @@ df = pd.DataFrame({
     'time_s': time_s
 })
 
-df.to_csv('neutron_data_1000.csv', index=False)
-print(f"成功生成包含 {num_neutrons} 条数据的 neutron_data_1000.csv")
+df.to_csv(f'neutron_data_{num_neutrons}.csv', index=False)
+print(f"成功生成包含 {num_neutrons} 条数据的 neutron_data_{num_neutrons}.csv")
 
